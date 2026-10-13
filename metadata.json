@@ -1,0 +1,6 @@
+{
+  "name": "JevQuant - Multi-Timeframe Crypto Trading Bot",
+  "description": "Autonomous quantitative crypto trading engine powered by TypeSafe Jev primitives across multi-timeframes with Binance API connectivity.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
