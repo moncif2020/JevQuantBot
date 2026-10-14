@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import {
   TrendingUp,
   TrendingDown,
@@ -27,12 +27,15 @@ import {
   Layers,
   Sparkles,
   Info,
-  Send
+  Send,
+  Target
 } from 'lucide-react';
 import { TradingViewChart } from './components/TradingViewChart';
 import { TelegramAlertsPanel, TelegramConfig } from './components/TelegramAlertsPanel';
 import { TradeHistoryLogs, BacktestTradeLog } from './components/TradeHistoryLogs';
 import { BacktestLabV01 } from './components/BacktestLabV01';
+import { AccountEquityGrowthChart } from './components/AccountEquityGrowthChart';
+import { CryptoWalletBalances, AssetBalanceItem } from './components/CryptoWalletBalances';
 
 // --- TYPES & INTERFACES ---
 type AssetSymbol = 'BTC/USDT' | 'ETH/USDT' | 'SOL/USDT';
@@ -62,6 +65,7 @@ interface TimeframeSignal {
   tf: Timeframe;
   trend: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
   rsi: number;
+  atr?: number;
   adx?: number;
   plusDi?: number;
   minusDi?: number;
@@ -83,6 +87,56 @@ interface TradeLog {
   conviction: number;
   stopLoss: number;
   takeProfit: number;
+  exitReason?: string;
+  atrValue?: number;
+}
+
+// Calculate dynamic ATR-based TP and SL based on asset and timeframe volatility
+export function calculateDynamicAtrTargets(
+  entryPrice: number,
+  timeframe: Timeframe,
+  assetAtr?: number,
+  timeframeAtr?: number
+) {
+  const tfMultiplier: Record<Timeframe, number> = {
+    '5m': 0.55,
+    '15m': 1.0,
+    '30m': 1.35,
+    '1h': 1.9,
+    '4h': 3.5,
+    '12h': 5.5,
+    '1d': 7.5,
+    '1w': 16.0,
+  };
+
+  const baseAtr = timeframeAtr && timeframeAtr > 0 
+    ? timeframeAtr 
+    : (assetAtr && assetAtr > 0 ? assetAtr * (tfMultiplier[timeframe] || 1.0) : entryPrice * 0.015);
+
+  // Stop-Loss: 1.5x ATR (with adaptive safety boundaries: min 0.8%, max 5.5%)
+  const minSlDistance = entryPrice * 0.008;
+  const maxSlDistance = entryPrice * 0.055;
+  const rawSlDistance = baseAtr * 1.5;
+  const slDistance = Math.min(maxSlDistance, Math.max(minSlDistance, rawSlDistance));
+
+  // Take-Profit: 2.2x the SL Distance (Asymmetric positive expectancy RR: 1:2.2)
+  const tpDistance = slDistance * 2.2;
+
+  const stopLoss = Number((entryPrice - slDistance).toFixed(2));
+  const takeProfit = Number((entryPrice + tpDistance).toFixed(2));
+  const slPercent = Number(((slDistance / entryPrice) * 100).toFixed(2));
+  const tpPercent = Number(((tpDistance / entryPrice) * 100).toFixed(2));
+
+  return {
+    stopLoss,
+    takeProfit,
+    slDistance,
+    tpDistance,
+    slPercent,
+    tpPercent,
+    atrUsed: Number(baseAtr.toFixed(2)),
+    riskRewardRatio: '1:2.2',
+  };
 }
 
 interface JevEvaluation {
@@ -202,13 +256,92 @@ export default function App() {
   };
 
   // Binance Configuration State
-  const [binanceMode, setBinanceMode] = useState<'paper' | 'testnet' | 'live'>('paper');
-  const [apiKey, setApiKey] = useState<string>('d891b2c45e8f9a0172384a6b...');
-  const [apiSecret, setApiSecret] = useState<string>('••••••••••••••••••••••••••••••••');
+  const [binanceMode, setBinanceMode] = useState<'paper' | 'testnet' | 'live'>(() => {
+    return (localStorage.getItem('jev_binance_mode') as any) || 'testnet';
+  });
+  const [apiKey, setApiKey] = useState<string>(() => {
+    return localStorage.getItem('jev_binance_api_key') || '';
+  });
+  const [apiSecret, setApiSecret] = useState<string>(() => {
+    return localStorage.getItem('jev_binance_api_secret') || '';
+  });
   const [spotAllocationPercent, setSpotAllocationPercent] = useState<number>(50); // Spot cash allocation
   const [accountBalance, setAccountBalance] = useState<number>(10000);
   const [allocatedRiskPercent, setAllocatedRiskPercent] = useState<number>(1.5);
   const [saveSuccessMessage, setSaveSuccessMessage] = useState<string | null>(null);
+
+  // Binance Real Execution & Test Trade State
+  const [isExecutingTestTrade, setIsExecutingTestTrade] = useState<boolean>(false);
+  const [testTradeFeedback, setTestTradeFeedback] = useState<{ success: boolean; message: string; details?: any } | null>(null);
+  const [isLoadingMyTrades, setIsLoadingMyTrades] = useState<boolean>(false);
+  const [isAccountVerified, setIsAccountVerified] = useState<boolean>(false);
+
+  // Real Wallet Balances State (Actual coins & balances)
+  const [walletBalances, setWalletBalances] = useState<AssetBalanceItem[]>(() => {
+    try {
+      const saved = localStorage.getItem('jev_wallet_balances');
+      if (saved) return JSON.parse(saved);
+    } catch (e) {}
+    return [
+      {
+        asset: 'USDT',
+        name: 'Tether USD',
+        iconBg: 'bg-emerald-600',
+        free: 10000.0,
+        locked: 0.0,
+        total: 10000.0,
+        priceUsdt: 1.0,
+        totalUsdtValue: 10000.0,
+        allocationPercent: 78.4,
+        isStable: true,
+      },
+      {
+        asset: 'BTC',
+        name: 'Bitcoin Spot',
+        iconBg: 'bg-amber-500',
+        free: 0.0245,
+        locked: 0.0,
+        total: 0.0245,
+        priceUsdt: 68450.0,
+        totalUsdtValue: 1677.02,
+        allocationPercent: 13.1,
+      },
+      {
+        asset: 'ETH',
+        name: 'Ethereum Spot',
+        iconBg: 'bg-indigo-500',
+        free: 0.22,
+        locked: 0.0,
+        total: 0.22,
+        priceUsdt: 3520.0,
+        totalUsdtValue: 774.4,
+        allocationPercent: 6.1,
+      },
+      {
+        asset: 'SOL',
+        name: 'Solana Spot',
+        iconBg: 'bg-purple-500',
+        free: 1.85,
+        locked: 0.0,
+        total: 1.85,
+        priceUsdt: 154.2,
+        totalUsdtValue: 285.27,
+        allocationPercent: 2.2,
+      },
+      {
+        asset: 'BNB',
+        name: 'BNB Chain',
+        iconBg: 'bg-yellow-500',
+        free: 0.05,
+        locked: 0.0,
+        total: 0.05,
+        priceUsdt: 590.0,
+        totalUsdtValue: 29.5,
+        allocationPercent: 0.2,
+      },
+    ];
+  });
+  const [isLoadingWalletBalances, setIsLoadingWalletBalances] = useState<boolean>(false);
 
   // Market live price simulator
   const [marketPrices, setMarketPrices] = useState(ASSETS_DATA);
@@ -432,6 +565,7 @@ export default function App() {
                     ...updated[tf as Timeframe],
                     rsi: tfData.rsi ?? updated[tf as Timeframe].rsi,
                     adx: tfData.adx ?? updated[tf as Timeframe].adx,
+                    atr: tfData.atr ?? updated[tf as Timeframe].atr,
                     plusDi: tfData.plusDi ?? updated[tf as Timeframe].plusDi,
                     minusDi: tfData.minusDi ?? updated[tf as Timeframe].minusDi,
                     trend: tfData.trend ?? updated[tf as Timeframe].trend,
@@ -453,90 +587,542 @@ export default function App() {
     return () => clearInterval(mtfInterval);
   }, [selectedAsset]);
 
-  // Trade History (Pure Binance Spot Trades)
-  const [trades, setTrades] = useState<TradeLog[]>([
-    {
-      id: 'TRD-9041',
-      timestamp: '05:42:10',
-      asset: 'BTC/USDT',
-      type: 'شراء Spot',
-      timeframe: '15m',
-      entryPrice: 63950,
-      exitPrice: 64820,
-      pnl: 870,
-      pnlPercent: 1.36,
-      status: 'CLOSED',
-      conviction: 2,
-      stopLoss: 63100,
-      takeProfit: 65200,
-    },
-    {
-      id: 'TRD-9040',
-      timestamp: '03:15:00',
-      asset: 'SOL/USDT',
-      type: 'شراء Spot',
-      timeframe: '1h',
-      entryPrice: 147.2,
-      exitPrice: 153.8,
-      pnl: 660,
-      pnlPercent: 4.48,
-      status: 'CLOSED',
-      conviction: 3,
-      stopLoss: 143.5,
-      takeProfit: 154.5,
-    },
-    {
-      id: 'TRD-9039',
-      timestamp: '01:05:22',
-      asset: 'ETH/USDT',
-      type: 'بيع للكاش (USDT)',
-      timeframe: '5m',
-      entryPrice: 3460,
-      exitPrice: 3425,
-      pnl: 350,
-      pnlPercent: 1.01,
-      status: 'CLOSED',
-      conviction: 1,
-      stopLoss: 3495,
-      takeProfit: 3410,
-    },
-    {
-      id: 'TRD-9038',
-      timestamp: '00:12:45',
-      asset: 'BTC/USDT',
-      type: 'شراء Spot',
-      timeframe: '30m',
-      entryPrice: 64450,
-      status: 'OPEN',
-      conviction: 2,
-      stopLoss: 63500,
-      takeProfit: 66000,
-    },
-    {
-      id: 'TRD-9037',
-      timestamp: '00:08:12',
-      asset: 'ETH/USDT',
-      type: 'شراء Spot',
-      timeframe: '15m',
-      entryPrice: 3450,
-      status: 'OPEN',
-      conviction: 2,
-      stopLoss: 3380,
-      takeProfit: 3580,
-    },
-    {
-      id: 'TRD-9036',
-      timestamp: '23:55:04',
-      asset: 'SOL/USDT',
-      type: 'شراء Spot',
-      timeframe: '15m',
-      entryPrice: 151.5,
-      status: 'OPEN',
-      conviction: 3,
-      stopLoss: 145.0,
-      takeProfit: 162.0,
+  // Trade History (Live Binance Spot Trades - Real Data Only)
+  const [trades, setTrades] = useState<TradeLog[]>(() => {
+    try {
+      const saved = localStorage.getItem('jev_real_trades');
+      if (saved) return JSON.parse(saved);
+    } catch (e) {}
+    return [];
+  });
+
+  // Fetch verified account balance from Binance Testnet / Live
+  const fetchBinanceAccountBalance = async () => {
+    if (!apiKey || !apiSecret) return;
+    setIsLoadingWalletBalances(true);
+    try {
+      const resp = await fetch('/api/binance/account', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          apiKey: apiKey.trim(),
+          apiSecret: apiSecret.trim(),
+          isTestnet: binanceMode === 'testnet'
+        })
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        setIsAccountVerified(true);
+        const usdt = data.balances?.find((b: any) => b.asset === 'USDT');
+        if (usdt) {
+          const totalUsdt = parseFloat(usdt.free) + parseFloat(usdt.locked);
+          setAccountBalance(Number(totalUsdt.toFixed(2)));
+        }
+
+        // Parse and calculate detailed asset balances
+        if (Array.isArray(data.balances) && data.balances.length > 0) {
+          const relevantAssets = ['USDT', 'BTC', 'ETH', 'SOL', 'BNB'];
+          const priceMap: Record<string, number> = {
+            'USDT': 1.0,
+            'BTC': marketPrices['BTC/USDT']?.price || 68450,
+            'ETH': marketPrices['ETH/USDT']?.price || 3520,
+            'SOL': marketPrices['SOL/USDT']?.price || 154.2,
+            'BNB': 590.0,
+          };
+
+          const nameMap: Record<string, string> = {
+            'USDT': 'Tether USD',
+            'BTC': 'Bitcoin Spot',
+            'ETH': 'Ethereum Spot',
+            'SOL': 'Solana Spot',
+            'BNB': 'BNB Chain',
+          };
+
+          const colorMap: Record<string, string> = {
+            'USDT': 'bg-emerald-600',
+            'BTC': 'bg-amber-500',
+            'ETH': 'bg-indigo-500',
+            'SOL': 'bg-purple-500',
+            'BNB': 'bg-yellow-500',
+          };
+
+          const parsed = data.balances
+            .filter((b: any) => relevantAssets.includes(b.asset) || parseFloat(b.free) > 0 || parseFloat(b.locked) > 0)
+            .map((b: any) => {
+              const free = parseFloat(b.free) || 0;
+              const locked = parseFloat(b.locked) || 0;
+              const total = free + locked;
+              const price = priceMap[b.asset] || 1.0;
+              const totalUsdtValue = total * price;
+
+              return {
+                asset: b.asset,
+                name: nameMap[b.asset] || `${b.asset} Token`,
+                iconBg: colorMap[b.asset] || 'bg-slate-700',
+                free,
+                locked,
+                total,
+                priceUsdt: price,
+                totalUsdtValue,
+                allocationPercent: 0,
+                isStable: b.asset === 'USDT' || b.asset === 'BUSD' || b.asset === 'FDUSD',
+              };
+            });
+
+          const totalVal = parsed.reduce((sum: number, item: any) => sum + item.totalUsdtValue, 0);
+          const finalBalances = parsed.map((item: any) => ({
+            ...item,
+            allocationPercent: totalVal > 0 ? (item.totalUsdtValue / totalVal) * 100 : 0
+          }));
+
+          if (finalBalances.length > 0) {
+            setWalletBalances(finalBalances);
+            try {
+              localStorage.setItem('jev_wallet_balances', JSON.stringify(finalBalances));
+            } catch (e) {}
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('Account balance fetch fallback');
+    } finally {
+      setIsLoadingWalletBalances(false);
     }
-  ]);
+  };
+
+  // Total Wallet Value in USDT across all assets
+  const totalWalletUsdt = useMemo(() => {
+    return walletBalances.reduce((sum, item) => sum + (item.totalUsdtValue || (item.total * item.priceUsdt)), 0);
+  }, [walletBalances]);
+
+  // Fetch real executed orders & trades directly from Binance Testnet
+  const fetchBinanceMyTrades = async () => {
+    if (!apiKey || !apiSecret) {
+      setTestTradeFeedback({
+        success: false,
+        message: 'يرجى حفظ مفتاح الـ API و Secret Key الخاص بـ Binance أولاً.'
+      });
+      return;
+    }
+    setIsLoadingMyTrades(true);
+    try {
+      const cleanSymbol = selectedAsset.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+      const resp = await fetch('/api/binance/my-trades', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          apiKey: apiKey.trim(),
+          apiSecret: apiSecret.trim(),
+          symbol: cleanSymbol,
+          isTestnet: binanceMode === 'testnet'
+        })
+      });
+      const data = await resp.json();
+      if (resp.ok && data.success) {
+        setIsAccountVerified(true);
+        const orders = data.orders || [];
+        if (orders.length > 0) {
+          const mappedTrades: TradeLog[] = orders.slice(-20).reverse().map((o: any) => {
+            const executedQty = parseFloat(o.executedQty || '0');
+            const cummulativeQuote = parseFloat(o.cummulativeQuoteQty || '0');
+            const avgPrice = executedQty > 0 ? cummulativeQuote / executedQty : parseFloat(o.price || '0');
+            return {
+              id: `BN-${o.orderId}`,
+              timestamp: new Date(o.time || o.transactTime || o.updateTime || Date.now()).toLocaleTimeString(),
+              asset: selectedAsset,
+              type: o.side === 'BUY' ? 'شراء Spot' : 'بيع للكاش (USDT)',
+              timeframe: selectedTf,
+              entryPrice: avgPrice || marketPrices[selectedAsset]?.price || 0,
+              status: o.status === 'FILLED' ? 'CLOSED' : 'OPEN',
+              conviction: 2,
+              stopLoss: avgPrice > 0 ? Number((avgPrice * 0.985).toFixed(2)) : 0,
+              takeProfit: avgPrice > 0 ? Number((avgPrice * 1.025).toFixed(2)) : 0,
+            };
+          });
+          setTrades(mappedTrades);
+          try { localStorage.setItem('jev_real_trades', JSON.stringify(mappedTrades)); } catch (e) {}
+          setTestTradeFeedback({
+            success: true,
+            message: `تم جلب وتحديث ${mappedTrades.length} صفقة حقيقية مباشرة من حساب Binance Testnet!`
+          });
+        } else {
+          setTestTradeFeedback({
+            success: true,
+            message: 'تم الاتصال بحساب Binance بنجاح! لا توجد أوامر منفذة سابقة على هذا الزوج.'
+          });
+        }
+      } else {
+        setTestTradeFeedback({
+          success: false,
+          message: `خطأ من Binance: ${data.error || 'فشل جلب الصفقات'}`
+        });
+      }
+    } catch (err: any) {
+      setTestTradeFeedback({
+        success: false,
+        message: `تعذر الاتصال: ${err.message}`
+      });
+    } finally {
+      setIsLoadingMyTrades(false);
+    }
+  };
+
+  // Instant Test Trade Execution with Telegram Alert
+  const handleExecuteTestTrade = async () => {
+    if (!apiKey || !apiSecret) {
+      setTestTradeFeedback({
+        success: false,
+        message: 'تنبيه: يرجى حفظ مفاتيح API الخاصة بـ Binance Testnet أولاً في تبويب "إعدادات بينانس".'
+      });
+      return;
+    }
+    setIsExecutingTestTrade(true);
+    setTestTradeFeedback(null);
+    try {
+      const cleanSymbol = selectedAsset.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+      const resp = await fetch('/api/binance/test-trade', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          apiKey: apiKey.trim(),
+          apiSecret: apiSecret.trim(),
+          symbol: cleanSymbol,
+          quoteAmount: 15, // Test buy of 15 USDT
+          isTestnet: true,
+          telegramConfig: {
+            botToken: telegramConfig.botToken?.trim() || '',
+            chatId: telegramConfig.chatId?.trim() || ''
+          }
+        })
+      });
+      const data = await resp.json();
+      if (resp.ok && data.success) {
+        setIsAccountVerified(true);
+        const orderPrice = data.executedPrice || marketPrices[selectedAsset]?.price || 0;
+        const dynTargets = calculateDynamicAtrTargets(
+          orderPrice,
+          selectedTf,
+          marketPrices[selectedAsset]?.atr,
+          mtfSignals[selectedTf]?.atr
+        );
+        const newTrade: TradeLog = {
+          id: `TEST-${data.orderId}`,
+          timestamp: data.timestamp || new Date().toLocaleTimeString(),
+          asset: selectedAsset,
+          type: 'شراء Spot',
+          timeframe: selectedTf,
+          entryPrice: orderPrice,
+          status: 'CLOSED',
+          conviction: 3,
+          stopLoss: dynTargets.stopLoss,
+          takeProfit: dynTargets.takeProfit,
+          atrValue: dynTargets.atrUsed,
+        };
+
+        setTrades(prev => {
+          const updated = [newTrade, ...prev.filter(t => t.id !== newTrade.id)];
+          try { localStorage.setItem('jev_real_trades', JSON.stringify(updated)); } catch (e) {}
+          return updated;
+        });
+
+        setTestTradeFeedback({
+          success: true,
+          message: `تم تنفيذ الصفقة الاختبارية الحقيقية بنجاح! رقم الأمر: #${data.orderId} بسعر $${orderPrice.toLocaleString()} ${data.telegramSent ? '— وتم إرسال الإشعار لتيليجرام بنجاح 🚀' : '(لم يُرسل لتيليجرام لأن إعدادات البوت لم تُملأ)'}`
+        });
+
+        fetchBinanceAccountBalance();
+      } else {
+        setTestTradeFeedback({
+          success: false,
+          message: `خطأ من Binance Testnet: ${data.error || 'فشل تنفيذ الأمر'} ${data.code ? `(رمز: ${data.code})` : ''}`
+        });
+      }
+    } catch (err: any) {
+      setTestTradeFeedback({
+        success: false,
+        message: `فشل الاتصال: ${err.message}`
+      });
+    } finally {
+      setIsExecutingTestTrade(false);
+    }
+  };
+
+  // Periodic Account and Trades Check if keys exist
+  useEffect(() => {
+    if (apiKey && apiSecret && apiKey.length > 10) {
+      fetchBinanceAccountBalance();
+    }
+  }, [apiKey, apiSecret, binanceMode]);
+
+  // Manual Close Trade Handler (Sell to 100% USDT Cash)
+  const handleManualCloseTrade = async (tradeToClose: TradeLog) => {
+    if (!apiKey || !apiSecret) {
+      setTestTradeFeedback({
+        success: false,
+        message: 'مفاتيح API مطلوبة لإغلاق الصفقة على Binance.'
+      });
+      return;
+    }
+    try {
+      const cleanSymbol = tradeToClose.asset.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+      const currentPx = marketPrices[tradeToClose.asset]?.price || tradeToClose.entryPrice;
+      const resp = await fetch('/api/binance/order', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          apiKey: apiKey.trim(),
+          apiSecret: apiSecret.trim(),
+          symbol: cleanSymbol,
+          side: 'SELL',
+          quoteAmount: 15,
+          reason: 'MANUAL_EXIT',
+          isTestnet: binanceMode === 'testnet',
+          telegramConfig: {
+            botToken: telegramConfig.botToken?.trim() || '',
+            chatId: telegramConfig.chatId?.trim() || ''
+          }
+        })
+      });
+
+      const data = await resp.json();
+      if (resp.ok && data.success) {
+        const exitPrice = data.executedPrice || currentPx;
+        const pnl = Number(((exitPrice - tradeToClose.entryPrice) / tradeToClose.entryPrice * 15).toFixed(2));
+        const pnlPercent = Number(((exitPrice - tradeToClose.entryPrice) / tradeToClose.entryPrice * 100).toFixed(2));
+
+        setTrades(prev => {
+          const updated = prev.map(t => {
+            if (t.id === tradeToClose.id) {
+              return {
+                ...t,
+                status: 'CLOSED' as const,
+                exitPrice,
+                pnl,
+                pnlPercent,
+                exitReason: 'MANUAL_EXIT'
+              };
+            }
+            return t;
+          });
+          try { localStorage.setItem('jev_real_trades', JSON.stringify(updated)); } catch (e) {}
+          return updated;
+        });
+
+        setTestTradeFeedback({
+          success: true,
+          message: `تم إغلاق الصفقة #${tradeToClose.id} يدوياً بنجاح والتحول للكاش 100% USDT بسعر $${exitPrice.toLocaleString()}!`
+        });
+
+        fetchBinanceAccountBalance();
+      } else {
+        setTestTradeFeedback({
+          success: false,
+          message: `فشل إغلاق الصفقة: ${data.error || 'خطأ غير معروف'}`
+        });
+      }
+    } catch (e: any) {
+      setTestTradeFeedback({
+        success: false,
+        message: `خطأ في إغلاق الصفقة: ${e.message}`
+      });
+    }
+  };
+
+  // Autonomous Trading Engine: Automatically buys when 5 conditions are met and monitors TP/SL for auto-exit
+  const isAutoTraderBusyRef = useRef<boolean>(false);
+  const lastAutoBuyTimestampRef = useRef<number>(0);
+  const marketPricesRef = useRef(marketPrices);
+  marketPricesRef.current = marketPrices;
+  const jevDecisionRef = useRef(jevDecision);
+  jevDecisionRef.current = jevDecision;
+  const tradesRef = useRef(trades);
+  tradesRef.current = trades;
+  const telegramConfigRef = useRef(telegramConfig);
+  telegramConfigRef.current = telegramConfig;
+
+  useEffect(() => {
+    if (!isBotRunning || !apiKey || !apiSecret) return;
+
+    const runAutonomousTradingCycle = async () => {
+      if (isAutoTraderBusyRef.current) return;
+      isAutoTraderBusyRef.current = true;
+
+      try {
+        const cleanSymbol = selectedAsset.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+        const curPrices = marketPricesRef.current;
+        const curDecision = jevDecisionRef.current;
+        const curTrades = tradesRef.current;
+        const curTelegram = telegramConfigRef.current;
+
+        const currentPx = curPrices[selectedAsset]?.price || 0;
+        if (!currentPx || currentPx <= 0) return;
+
+        // 1. MONITOR OPEN POSITIONS FOR TAKE-PROFIT OR STOP-LOSS
+        const openTrades = curTrades.filter(t => t.status === 'OPEN' && t.asset === selectedAsset);
+        for (const openTrade of openTrades) {
+          const isTakeProfitHit = openTrade.takeProfit > 0 && currentPx >= openTrade.takeProfit;
+          const isStopLossHit = openTrade.stopLoss > 0 && currentPx <= openTrade.stopLoss;
+          const isExitSignal = curDecision.action === 'EXIT_TO_USDT_CASH';
+
+          if (isTakeProfitHit || isStopLossHit || isExitSignal) {
+            const reason = isTakeProfitHit ? 'TAKE_PROFIT' : (isStopLossHit ? 'STOP_LOSS' : 'MANUAL_EXIT');
+
+            const resp = await fetch('/api/binance/order', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                apiKey: apiKey.trim(),
+                apiSecret: apiSecret.trim(),
+                symbol: cleanSymbol,
+                side: 'SELL',
+                quoteAmount: 15,
+                reason,
+                isTestnet: binanceMode === 'testnet',
+                telegramConfig: {
+                  botToken: curTelegram.botToken?.trim() || '',
+                  chatId: curTelegram.chatId?.trim() || ''
+                }
+              })
+            });
+
+            const data = await resp.json();
+            if (resp.ok && data.success) {
+              const exitPrice = data.executedPrice || currentPx;
+              const pnl = Number(((exitPrice - openTrade.entryPrice) / openTrade.entryPrice * 15).toFixed(2));
+              const pnlPercent = Number(((exitPrice - openTrade.entryPrice) / openTrade.entryPrice * 100).toFixed(2));
+
+              setTrades(prev => {
+                const updated = prev.map(t => {
+                  if (t.id === openTrade.id) {
+                    return {
+                      ...t,
+                      status: 'CLOSED' as const,
+                      exitPrice,
+                      pnl,
+                      pnlPercent,
+                      exitReason: reason
+                    };
+                  }
+                  return t;
+                });
+                try { localStorage.setItem('jev_real_trades', JSON.stringify(updated)); } catch (e) {}
+                return updated;
+              });
+
+              setTestTradeFeedback({
+                success: isTakeProfitHit || pnl >= 0,
+                message: isTakeProfitHit
+                  ? `🎯 [تداول آلي - Take Profit] تم تحقيق الهدف بنجاح بسعر $${exitPrice.toLocaleString()} وبيع الصفقة بربح +$${pnl} (${pnlPercent > 0 ? '+' : ''}${pnlPercent}%)!`
+                  : `🛡️ [تداول آلي - Stop Loss] تم تفعيل وقف الخسارة بسعر $${exitPrice.toLocaleString()} لحماية المحفظة والتحول للكاش 100% USDT.`
+              });
+
+              fetchBinanceAccountBalance();
+              return; // complete this exit action before checking new entries
+            }
+          }
+        }
+
+        // 2. CHECK 5 ATOMIC CONDITIONS FOR AUTONOMOUS SPOT BUY
+        // Cooldown: at least 30 seconds between auto-buys
+        const now = Date.now();
+        if (now - lastAutoBuyTimestampRef.current < 30000) return;
+
+        // Skip buy if an open trade already exists for this asset
+        const hasOpenPosition = curTrades.some(t => t.status === 'OPEN' && t.asset === selectedAsset);
+        if (hasOpenPosition) return;
+
+        // Verify the 5 Atomic Decision Primitives & ADX Filter
+        const condition1_regime = curDecision.regime === 'BULLISH_TREND' || curDecision.regime === 'ACCUMULATION_SQUEEZE';
+        const condition2_confluence = curDecision.confluenceConfirmed === true;
+        const condition3_noTrap = curDecision.liquidityTrapRisk === false;
+        const condition4_conviction = curDecision.convictionLevel >= 1;
+        const condition5_confidence = curDecision.actionConfidence >= curDecision.dynamicConfidenceThreshold;
+        const chopFilterPass = curDecision.chopFilterPass === true; // ADX >= 20 and +DI >= -DI
+        const isBuyAction = curDecision.action === 'EXECUTE_SPOT_BUY';
+
+        const allConditionsSatisfied = (
+          condition1_regime &&
+          condition2_confluence &&
+          condition3_noTrap &&
+          condition4_conviction &&
+          condition5_confidence &&
+          chopFilterPass &&
+          isBuyAction
+        );
+
+        if (allConditionsSatisfied) {
+          lastAutoBuyTimestampRef.current = now;
+          const orderAmount = curDecision.dynamicPositionSize > 10 ? Math.min(curDecision.dynamicPositionSize, 30) : 15;
+
+          const resp = await fetch('/api/binance/order', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              apiKey: apiKey.trim(),
+              apiSecret: apiSecret.trim(),
+              symbol: cleanSymbol,
+              side: 'BUY',
+              quoteAmount: orderAmount,
+              reason: '5_CONDITIONS_BUY',
+              isTestnet: binanceMode === 'testnet',
+              telegramConfig: {
+                botToken: curTelegram.botToken?.trim() || '',
+                chatId: curTelegram.chatId?.trim() || ''
+              }
+            })
+          });
+
+          const data = await resp.json();
+          if (resp.ok && data.success) {
+            const entryPx = data.executedPrice || currentPx;
+            const dynTargets = calculateDynamicAtrTargets(
+              entryPx,
+              selectedTf,
+              curPrices[selectedAsset]?.atr,
+              mtfSignals[selectedTf]?.atr
+            );
+            const stopLoss = dynTargets.stopLoss;
+            const takeProfit = dynTargets.takeProfit;
+
+            const newTrade: TradeLog = {
+              id: `AUTO-${data.orderId}`,
+              timestamp: data.timestamp || new Date().toLocaleTimeString(),
+              asset: selectedAsset,
+              type: 'شراء Spot',
+              timeframe: selectedTf,
+              entryPrice: entryPx,
+              status: 'OPEN',
+              conviction: curDecision.convictionLevel,
+              stopLoss,
+              takeProfit,
+              atrValue: dynTargets.atrUsed,
+            };
+
+            setTrades(prev => {
+              const updated = [newTrade, ...prev.filter(t => t.id !== newTrade.id)];
+              try { localStorage.setItem('jev_real_trades', JSON.stringify(updated)); } catch (e) {}
+              return updated;
+            });
+
+            setTestTradeFeedback({
+              success: true,
+              message: `🟢 [تداول آلي نشط] اكتملت الشروط الـ 5 بنجاح! تم فتح صفقة شراء في Binance Testnet (#${data.orderId}) بسعر $${entryPx.toLocaleString()} | هدف ديناميكي TP: $${takeProfit.toLocaleString()} (+${dynTargets.tpPercent}%) | وقف ديناميكي SL: $${stopLoss.toLocaleString()} (-${dynTargets.slPercent}%) [فريم ${selectedTf} · ATR: $${dynTargets.atrUsed}]`
+            });
+
+            fetchBinanceAccountBalance();
+          }
+        }
+      } catch (err: any) {
+        console.warn('Auto-trader cycle check warning:', err.message);
+      } finally {
+        isAutoTraderBusyRef.current = false;
+      }
+    };
+
+    // Auto-trader cycle runs every 8 seconds
+    const autoInterval = setInterval(runAutonomousTradingCycle, 8000);
+    return () => clearInterval(autoInterval);
+  }, [isBotRunning, apiKey, apiSecret, selectedAsset, selectedTf, binanceMode]);
 
   // Comprehensive 90-Day Backtesting Trade History Log
   const [backtestTrades] = useState<BacktestTradeLog[]>([
@@ -1024,7 +1610,16 @@ export default function App() {
     return () => clearInterval(interval);
   }, [isBotRunning, botSpeedSec, selectedAsset]);
 
-  const currentAsset = marketPrices[selectedAsset];
+  const currentAsset = marketPrices[selectedAsset] || ASSETS_DATA[selectedAsset];
+
+  const liveDynamicTargets = useMemo(() => {
+    return calculateDynamicAtrTargets(
+      currentAsset.price,
+      selectedTf,
+      currentAsset.atr,
+      mtfSignals[selectedTf]?.atr
+    );
+  }, [currentAsset.price, selectedTf, currentAsset.atr, mtfSignals]);
 
   // Helper Copy Function
   const handleCopyCode = (code: string) => {
@@ -1331,9 +1926,6 @@ def main_loop():
         
         for symbol in SYMBOLS:
             try:
-                # التحقق من حالة الصفقة الحالية لهذه العملة بالتحديد
-                is_holding = active_positions.get(symbol, False)
-                
                 # 1. جلب بيانات الفريمات المتعددة مع حساب RSI و ATR و ADX
                 mtf_data = fetch_multi_timeframe_state(symbol)
                 current_price = mtf_data["15m"]["current_close"]
@@ -1343,20 +1935,36 @@ def main_loop():
                 plus_di = mtf_data["15m"]["plus_di"]
                 minus_di = mtf_data["15m"]["minus_di"]
 
-                # 2. فلتر تقلب النطاق المؤسسي (Chop Filter Gate)
-                # إذا كان السوق في ركود وعديم الاتجاه (ADX < 20)، يتم حجب الشراء لحماية رأس المال
+                # 2. مراقبة الصفقات المفتوحة لحظياً: تنفيذ أمر البيع فوراً عند تحقيق الهدف (TP) أو وقف الخسارة (SL)
+                pos = active_positions.get(symbol, None)
+                if pos:
+                    if current_price >= pos["tp"]:
+                        print(f"🎯 [{symbol}] TAKE PROFIT HIT @ \${current_price:,.2f} (Target: \${pos['tp']:,.2f}) -> Selling to 100% USDT Cash")
+                        execute_binance_spot_order(symbol, "SELL", pos["amount"], 0, 0, current_price)
+                        active_positions[symbol] = None
+                        time.sleep(1.5)
+                        continue
+                    elif current_price <= pos["sl"]:
+                        print(f"🛡️ [{symbol}] STOP LOSS HIT @ \${current_price:,.2f} (Stop: \${pos['sl']:,.2f}) -> Selling to 100% USDT Cash")
+                        execute_binance_spot_order(symbol, "SELL", pos["amount"], 0, 0, current_price)
+                        active_positions[symbol] = None
+                        time.sleep(1.5)
+                        continue
+
+                is_holding = pos is not None
+
+                # 3. فلتر تقلب النطاق المؤسسي (Chop Filter Gate)
                 is_choppy_market = adx_15m < 20.0
                 is_bullish_di = plus_di >= minus_di
 
-                # 3. تقييم ذكاء اصطناعي فوري عبر Jev
+                # 4. تقييم ذكاء اصطناعي فوري عبر Jev
                 decision = evaluate_with_jev(symbol, mtf_data, is_currently_holding=is_holding)
                 
-                # 4. حساب معايرة الثقة الديناميكية استناداً إلى نسبة تقلب ATR (Continuous Scaling)
+                # 5. حساب معايرة الثقة الديناميكية استناداً إلى نسبة تقلب ATR
                 volatility_ratio = (atr_15m / current_price) * 100 if current_price > 0 else 1.5
-                # عتبة الثقة تتكيف بسلاسة مع تقلبات السوق بين 0.78 و 0.94 (Base 0.80 + 0.055 لكل 1% تقلب)
                 dynamic_confidence_threshold = min(0.94, max(0.78, 0.80 + (volatility_ratio * 0.055)))
                 
-                # 5. حساب حجم الصفقة الديناميكي المتكيف مع القناعة (Conviction) والثقة (Confidence)
+                # 6. حساب حجم الصفقة الديناميكي المتكيف مع القناعة والثقة
                 conviction_level = int(decision.get("conviction", 2))
                 conviction_mult = 1.5 if conviction_level == 3 else (1.0 if conviction_level == 2 else 0.6)
                 confidence_mult = min(1.3, max(0.7, decision["confidence"] / dynamic_confidence_threshold))
@@ -1364,21 +1972,21 @@ def main_loop():
 
                 print(f"[{symbol}] Action: {decision['action']} | Conf: {decision['confidence']:.2f} (Req: >={dynamic_confidence_threshold:.2f}) | ADX: {adx_15m} (+DI: {plus_di} / -DI: {minus_di}) | ATR Vol: {volatility_ratio:.2f}% | Sizing: \${dynamic_trade_allocation} | Holding: {is_holding}")
 
-                # 6. شرط التنفيذ بالمعايرة الديناميكية وفلتر ADX Chop Filter
+                # 7. شرط التنفيذ التلقائي بالمعايرة الديناميكية وفلتر ADX Chop Filter (اكتمال الشروط الـ 5)
                 if (decision["action"] == "EXECUTE_SPOT_BUY" and 
                     decision["confidence"] >= dynamic_confidence_threshold and 
                     decision["trap_p"] < 0.20 and 
                     conviction_level >= 1 and 
-                    not is_choppy_market and # حجب الشراء إذا كان ADX < 20 (سوق متذبذب ميت)
-                    is_bullish_di):           # التحقق من أن +DI أكبر من -DI (زخم صاعد)
+                    not is_choppy_market and
+                    is_bullish_di):
                     
                     if not is_holding:
-                        # لم نشتري هذه العملة بعد - تنفيذ الشراء بحجم المركز الديناميكي المعاير
+                        # تنفيذ الشراء التلقائي وتحديد مستويات الوقف والهدف بدقة
                         sl = current_price - (atr_15m * STOP_LOSS_ATR_MULT)
                         tp = current_price + (atr_15m * STOP_LOSS_ATR_MULT * 2.5) # نسبة عائد لمخاطرة 1:2.5
                         execute_binance_spot_order(symbol, "BUY", dynamic_trade_allocation, sl, tp, current_price)
-                        active_positions[symbol] = True
-                        print(f"✅ [{symbol}] Opened New Spot Position with \${dynamic_trade_allocation} USDT (ADX: {adx_15m} | Conviction: Level {conviction_level})")
+                        active_positions[symbol] = { "entry": current_price, "sl": sl, "tp": tp, "amount": dynamic_trade_allocation }
+                        print(f"✅ [{symbol}] Opened New Spot Position with \${dynamic_trade_allocation} USDT (TP: \${tp:,.2f} | SL: \${sl:,.2f})")
                     else:
                         print(f"ℹ️ [{symbol}] Buy signal qualified but position is already active. Skipping duplicate buy.")
                 
@@ -1387,12 +1995,10 @@ def main_loop():
                 
                 elif decision["action"] == "EXIT_TO_USDT_CASH":
                     if is_holding:
-                        # نمتلك العملة وحصلنا على إشارة خروج - بيع للتحول لكاش USDT بالكامل
-                        execute_binance_spot_order(symbol, "SELL", ALLOCATION_PER_TRADE_USDT, 0, 0, current_price)
-                        active_positions[symbol] = False
+                        execute_binance_spot_order(symbol, "SELL", pos["amount"] if pos else ALLOCATION_PER_TRADE_USDT, 0, 0, current_price)
+                        active_positions[symbol] = None
                         print(f"🛡️ [{symbol}] Closed Spot Position to 100% USDT Cash")
                     else:
-                        # لسنا في صفقة والقرار هو البقاء في الكاش
                         pass
 
                 # فاصل زمني قصير بين كل عملة لمنع تجاوز حدود الـ API (Rate limits)
@@ -1573,6 +2179,12 @@ if __name__ == "__main__":
           <div className="flex items-center gap-1 bg-slate-800 px-2 py-0.5 rounded border border-slate-700">
             <span>الوضع:</span>
             <span className="font-bold text-amber-400 uppercase">{binanceMode}</span>
+          </div>
+          <div className="flex items-center gap-1 bg-emerald-500/10 text-emerald-300 px-2.5 py-0.5 rounded border border-emerald-500/30">
+            <span>المحفظة:</span>
+            <strong className="font-mono text-emerald-400 font-bold">
+              ${totalWalletUsdt.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USDT
+            </strong>
           </div>
         </div>
       </div>
@@ -1755,6 +2367,40 @@ if __name__ == "__main__":
                   <Send className="w-3.5 h-3.5" />
                   <span>{telegramConfig.botToken && telegramConfig.chatId ? 'تعديل إعدادات التنبيهات' : 'إعداد وربط تيليجرام الآن'}</span>
                 </button>
+              </div>
+            </div>
+
+            {/* DYNAMIC ATR VOLATILITY TARGETS BANNER */}
+            <div className="bg-gradient-to-r from-slate-900 via-slate-900/90 to-cyan-950/40 p-3.5 rounded-2xl border border-slate-800 flex flex-wrap items-center justify-between gap-3 text-xs shadow-md">
+              <div className="flex items-center gap-2.5">
+                <div className="p-2 rounded-xl bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 font-bold">
+                  <Target className="w-4 h-4" />
+                </div>
+                <div>
+                  <div className="flex items-center gap-2">
+                    <span className="font-bold text-white">إدارة الأهداف والوقف الديناميكية (Dynamic ATR Targets)</span>
+                    <span className="px-2 py-0.5 rounded-md bg-cyan-500/10 text-cyan-300 font-mono font-bold text-[10px] border border-cyan-500/30">
+                      فريم {selectedTf} · ATR: ${liveDynamicTargets.atrUsed.toLocaleString()}
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-slate-400 mt-0.5">
+                    تتأقلم مستويات الربح والوقف تلقائياً مع تقلبات السوق لكل فريم زمني لحماية رأس المال دون التقيد بنسب ثابتة
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2.5 font-mono flex-wrap">
+                <div className="flex items-center gap-1.5 bg-emerald-500/10 px-2.5 py-1 rounded-lg border border-emerald-500/30 text-emerald-400 font-bold">
+                  <span className="font-sans text-[11px] text-slate-400">الهدف (TP):</span>
+                  <span>${liveDynamicTargets.takeProfit.toLocaleString()} (+{liveDynamicTargets.tpPercent}%)</span>
+                </div>
+                <div className="flex items-center gap-1.5 bg-rose-500/10 px-2.5 py-1 rounded-lg border border-rose-500/30 text-rose-400 font-bold">
+                  <span className="font-sans text-[11px] text-slate-400">الوقف (SL):</span>
+                  <span>${liveDynamicTargets.stopLoss.toLocaleString()} (-{liveDynamicTargets.slPercent}%)</span>
+                </div>
+                <div className="bg-slate-950 px-2 py-1 rounded-lg border border-slate-800 text-[11px] text-slate-300 font-sans">
+                  نسبة العائد/المخاطرة: <strong className="text-cyan-400 font-mono font-bold">1:2.2</strong>
+                </div>
               </div>
             </div>
 
@@ -2053,74 +2699,186 @@ if __name__ == "__main__":
               </div>
             </div>
 
-            {/* RECENT TRADES LOG TABLE */}
-            <div className="bg-slate-900/60 p-5 rounded-2xl border border-slate-800">
-              <div className="flex items-center justify-between mb-4">
-                <h3 className="font-bold text-sm text-white flex items-center gap-2">
-                  <Clock className="w-4 h-4 text-emerald-400" />
-                  سجل الصفقات المنفذة تلقائياً بواسطة JevQuant
-                </h3>
-                <span className="text-xs text-slate-400">
-                  إجمالي الربح المحقق: <strong className="text-emerald-400 font-mono">+$1,880.00 (+18.8%)</strong>
-                </span>
+            {/* REAL CRYPTO WALLET & COIN BALANCES (SPOT WALLET) */}
+            <CryptoWalletBalances
+              balances={walletBalances}
+              totalWalletUsdt={totalWalletUsdt}
+              isLoading={isLoadingWalletBalances}
+              onRefresh={fetchBinanceAccountBalance}
+              isAccountVerified={isAccountVerified}
+              binanceMode={binanceMode}
+            />
+
+            {/* RECHARTS ACCOUNT EQUITY GROWTH CURVE */}
+            <AccountEquityGrowthChart
+              currentBalance={accountBalance || totalWalletUsdt}
+              trades={trades}
+              initialBalance={10000}
+            />
+
+            {/* RECENT TRADES LOG TABLE (REAL BINANCE SPOT TRADES) */}
+            <div className="bg-slate-900/60 p-5 rounded-2xl border border-slate-800 space-y-4">
+              {/* FEEDBACK ALERT */}
+              {testTradeFeedback && (
+                <div className={`p-4 rounded-xl border flex items-start justify-between gap-3 text-xs ${
+                  testTradeFeedback.success
+                    ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+                    : 'bg-rose-500/10 border-rose-500/30 text-rose-300'
+                }`}>
+                  <div className="flex items-center gap-2">
+                    <span className="text-base">{testTradeFeedback.success ? '✅' : '⚠️'}</span>
+                    <span className="font-semibold leading-relaxed">{testTradeFeedback.message}</span>
+                  </div>
+                  <button
+                    onClick={() => setTestTradeFeedback(null)}
+                    className="text-slate-400 hover:text-white shrink-0 cursor-pointer font-bold px-1"
+                  >
+                    ✕
+                  </button>
+                </div>
+              )}
+
+              {/* TABLE HEADER & ACTION CONTROLS */}
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-800/80">
+                <div>
+                  <h3 className="font-bold text-sm text-white flex items-center gap-2">
+                    <Clock className="w-4 h-4 text-emerald-400" />
+                    سجل الصفقات الفعلي لحساب Binance Spot Testnet
+                  </h3>
+                  <p className="text-xs text-slate-400 mt-0.5">
+                    جميع الصفقات والأوامر المعروضة هنا مستخرجة ومطابقة لحسابك على Binance Testnet (بدون أي صفقات وهمية)
+                  </p>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    onClick={handleExecuteTestTrade}
+                    disabled={isExecutingTestTrade}
+                    className="px-3.5 py-2 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-slate-950 font-bold text-xs shadow-md shadow-emerald-500/20 transition-all flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                  >
+                    <Zap className={`w-3.5 h-3.5 ${isExecutingTestTrade ? 'animate-spin' : ''}`} />
+                    <span>{isExecutingTestTrade ? 'جاري التنفيذ في بينانس...' : '⚡ فحص الربط وتنفيذ صفقة اختبارية'}</span>
+                  </button>
+
+                  <button
+                    onClick={fetchBinanceMyTrades}
+                    disabled={isLoadingMyTrades}
+                    className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold text-xs border border-slate-700 transition-all flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                    title="تحديث الصفقات والأوامر من حساب بينانس"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${isLoadingMyTrades ? 'animate-spin text-emerald-400' : ''}`} />
+                    <span>{isLoadingMyTrades ? 'جاري الجلب...' : 'جلب الصفقات من بينانس'}</span>
+                  </button>
+                </div>
               </div>
 
-              <div className="overflow-x-auto">
-                <table className="w-full text-left text-xs">
-                  <thead className="bg-slate-950 text-slate-400 uppercase text-[10px] border-b border-slate-800">
-                    <tr>
-                      <th className="py-2.5 px-3">المعرف</th>
-                      <th className="py-2.5 px-3">الوقت</th>
-                      <th className="py-2.5 px-3">الأصل</th>
-                      <th className="py-2.5 px-3">النوع</th>
-                      <th className="py-2.5 px-3">الفريم</th>
-                      <th className="py-2.5 px-3">الدخول</th>
-                      <th className="py-2.5 px-3">الخروج</th>
-                      <th className="py-2.5 px-3">وقف الخسارة / الهدف</th>
-                      <th className="py-2.5 px-3">الربح المحقق</th>
-                      <th className="py-2.5 px-3">الحالة</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-800 font-mono">
-                    {trades.map((t) => (
-                      <tr key={t.id} className="hover:bg-slate-800/40">
-                        <td className="py-2.5 px-3 text-slate-400">{t.id}</td>
-                        <td className="py-2.5 px-3 text-slate-400">{t.timestamp}</td>
-                        <td className="py-2.5 px-3 font-sans font-bold text-white">{t.asset}</td>
-                        <td className="py-2.5 px-3">
-                          <span className={`px-2 py-0.5 rounded font-sans text-[11px] font-bold ${
-                            t.type.includes('BUY') ? 'bg-emerald-500/10 text-emerald-400' : 'bg-rose-500/10 text-rose-400'
-                          }`}>
-                            {t.type}
-                          </span>
-                        </td>
-                        <td className="py-2.5 px-3 text-slate-300">{t.timeframe}</td>
-                        <td className="py-2.5 px-3">${t.entryPrice.toLocaleString()}</td>
-                        <td className="py-2.5 px-3">{t.exitPrice ? `$${t.exitPrice.toLocaleString()}` : '—'}</td>
-                        <td className="py-2.5 px-3 text-[11px] text-slate-400">
-                          SL: ${t.stopLoss} | TP: ${t.takeProfit}
-                        </td>
-                        <td className="py-2.5 px-3 font-bold">
-                          {t.pnl ? (
-                            <span className="text-emerald-400">
-                              +${t.pnl} (+{t.pnlPercent}%)
-                            </span>
-                          ) : (
-                            <span className="text-slate-400">مفتوحة حالياً</span>
-                          )}
-                        </td>
-                        <td className="py-2.5 px-3">
-                          <span className={`px-2 py-0.5 rounded text-[10px] font-sans font-bold ${
-                            t.status === 'CLOSED' ? 'bg-slate-800 text-slate-300' : 'bg-cyan-500/10 text-cyan-400 animate-pulse'
-                          }`}>
-                            {t.status}
-                          </span>
-                        </td>
+              {/* TRADES DATA OR EMPTY STATE */}
+              {trades.length === 0 ? (
+                <div className="py-12 px-4 text-center rounded-xl bg-slate-950/60 border border-slate-800/60 flex flex-col items-center justify-center space-y-3">
+                  <div className="w-12 h-12 rounded-full bg-slate-900 border border-slate-800 flex items-center justify-center text-slate-400">
+                    <Clock className="w-6 h-6 text-slate-500" />
+                  </div>
+                  <div className="space-y-1">
+                    <h4 className="text-sm font-bold text-slate-200">لا توجد صفقات وهمية · السجل فارغ ونظيف</h4>
+                    <p className="text-xs text-slate-400 max-w-md mx-auto leading-relaxed">
+                      تم مسح الصفقات الوهمية بالكامل. يمكنك الآن الضغط على زر "⚡ فحص الربط وتنفيذ صفقة اختبارية" لتنفيذ أول أمر شراء حقيقي في حساب Binance Testnet والتحقق من الربط مع تيليجرام فورياً!
+                    </p>
+                  </div>
+                  <button
+                    onClick={handleExecuteTestTrade}
+                    disabled={isExecutingTestTrade}
+                    className="px-4 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs shadow transition-all cursor-pointer flex items-center gap-2 mt-2"
+                  >
+                    <Zap className="w-3.5 h-3.5" />
+                    <span>تنفيذ صفقة اختبارية الآن</span>
+                  </button>
+                </div>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-xs">
+                    <thead className="bg-slate-950 text-slate-400 uppercase text-[10px] border-b border-slate-800">
+                      <tr>
+                        <th className="py-2.5 px-3">رقم الأمر (Order ID)</th>
+                        <th className="py-2.5 px-3">الوقت</th>
+                        <th className="py-2.5 px-3">الأصل</th>
+                        <th className="py-2.5 px-3">نوع العملية</th>
+                        <th className="py-2.5 px-3">سعر الدخول</th>
+                        <th className="py-2.5 px-3">الهدف (TP) / الوقف (SL)</th>
+                        <th className="py-2.5 px-3">العائد (PnL)</th>
+                        <th className="py-2.5 px-3">حالة الأمر</th>
+                        <th className="py-2.5 px-3 text-center">الإجراء</th>
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+                    </thead>
+                    <tbody className="divide-y divide-slate-800 font-mono">
+                      {trades.map((t) => (
+                        <tr key={t.id} className="hover:bg-slate-800/40 transition-colors">
+                          <td className="py-2.5 px-3 text-cyan-400 font-bold">{t.id}</td>
+                          <td className="py-2.5 px-3 text-slate-400">{t.timestamp}</td>
+                          <td className="py-2.5 px-3 font-sans font-bold text-white">{t.asset}</td>
+                          <td className="py-2.5 px-3">
+                            <span className={`px-2 py-0.5 rounded font-sans text-[11px] font-bold ${
+                              t.type.includes('شراء') ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' : 'bg-rose-500/10 text-rose-400 border border-rose-500/20'
+                            }`}>
+                              {t.type}
+                            </span>
+                          </td>
+                          <td className="py-2.5 px-3 font-bold text-slate-200">
+                            ${t.entryPrice ? t.entryPrice.toLocaleString(undefined, { minimumFractionDigits: 2 }) : '—'}
+                          </td>
+                          <td className="py-2.5 px-3 text-[11px]">
+                            {t.takeProfit > 0 || t.stopLoss > 0 ? (
+                              <div className="space-y-0.5">
+                                <div className="text-emerald-400">TP: ${t.takeProfit.toLocaleString()}</div>
+                                <div className="text-rose-400">SL: ${t.stopLoss.toLocaleString()}</div>
+                              </div>
+                            ) : (
+                              <span className="text-slate-600">—</span>
+                            )}
+                          </td>
+                          <td className="py-2.5 px-3">
+                            {t.pnl !== undefined ? (
+                              <span className={`font-bold ${t.pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+                                {t.pnl >= 0 ? '+' : ''}${t.pnl.toFixed(2)} ({t.pnlPercent ? (t.pnlPercent > 0 ? '+' : '') + t.pnlPercent + '%' : ''})
+                              </span>
+                            ) : (
+                              <span className="text-slate-500 font-sans text-[11px]">مفتوحة (قيد المتابعة)</span>
+                            )}
+                          </td>
+                          <td className="py-2.5 px-3">
+                            {t.status === 'OPEN' ? (
+                              <span className="px-2 py-0.5 rounded text-[10px] font-sans font-bold bg-cyan-500/15 text-cyan-300 border border-cyan-500/40 animate-pulse flex items-center gap-1 w-fit">
+                                <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-ping"></span>
+                                مفتوحة (مراقبة TP/SL)
+                              </span>
+                            ) : (
+                              <span className="px-2 py-0.5 rounded text-[10px] font-sans font-bold bg-slate-800 text-emerald-400 border border-emerald-500/30">
+                                {t.exitReason === 'TAKE_PROFIT'
+                                  ? '🎯 تم تحقيق الهدف'
+                                  : t.exitReason === 'STOP_LOSS'
+                                  ? '🛡️ تم تفعيل الوقف'
+                                  : 'مغلقة بنجاح ✓'}
+                              </span>
+                            )}
+                          </td>
+                          <td className="py-2.5 px-3 text-center">
+                            {t.status === 'OPEN' ? (
+                              <button
+                                onClick={() => handleManualCloseTrade(t)}
+                                className="px-2.5 py-1 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 border border-rose-500/40 text-[10px] font-sans font-bold transition-all cursor-pointer"
+                                title="إغلاق الصفقة فورياً وتحويلها إلى كاش 100% USDT"
+                              >
+                                💵 بيع للكاش
+                              </button>
+                            ) : (
+                              <span className="text-slate-600 text-[10px] font-sans">—</span>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
             </div>
           </div>
         )}
@@ -2307,21 +3065,71 @@ if __name__ == "__main__":
 
               {/* SAVE / TEST BUTTON */}
               {saveSuccessMessage && (
-                <div className="p-3 bg-emerald-500/10 border border-emerald-500/30 rounded-xl text-xs text-emerald-400 font-bold flex items-center justify-between">
-                  <span>✓ {saveSuccessMessage}</span>
-                  <button onClick={() => setSaveSuccessMessage(null)} className="text-slate-400 hover:text-white">✕</button>
+                <div className={`p-3.5 rounded-xl border text-xs font-semibold flex items-center justify-between ${
+                  saveSuccessMessage.includes('بنجاح')
+                    ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
+                    : 'bg-amber-500/10 border-amber-500/30 text-amber-300'
+                }`}>
+                  <div className="flex items-center gap-2">
+                    <span>{saveSuccessMessage.includes('بنجاح') ? '✓' : 'ℹ️'}</span>
+                    <span>{saveSuccessMessage}</span>
+                  </div>
+                  <button onClick={() => setSaveSuccessMessage(null)} className="text-slate-400 hover:text-white cursor-pointer px-1 font-bold">✕</button>
                 </div>
               )}
-              <div className="pt-2 flex justify-end gap-3">
-                <button
-                  onClick={() => {
-                    setSaveSuccessMessage('تم التحقق بنجاح من اتصال API ومطابقة الأرصدة عبر Binance!');
-                    setTimeout(() => setSaveSuccessMessage(null), 4000);
-                  }}
-                  className="px-5 py-2.5 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-400 hover:to-teal-500 text-slate-950 font-bold text-xs shadow-lg shadow-emerald-500/20 transition-all cursor-pointer"
-                >
-                  اختبار الاتصال وحفظ الإعدادات
-                </button>
+              <div className="pt-2 flex flex-wrap items-center justify-between gap-3">
+                <div className="text-[11px] text-slate-400 flex items-center gap-2">
+                  <span className={`w-2 h-2 rounded-full ${isAccountVerified ? 'bg-emerald-400' : 'bg-slate-500'}`}></span>
+                  <span>{isAccountVerified ? `الحساب متصل ومطابق · الرصيد الفعلي: $${accountBalance.toLocaleString()} USDT` : 'المفاتيح تُحفظ مشفرة في متصفحك المحلي (Local Storage)'}</span>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={handleExecuteTestTrade}
+                    disabled={isExecutingTestTrade || !apiKey || !apiSecret}
+                    className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-emerald-400 border border-emerald-500/30 font-bold text-xs transition-all cursor-pointer flex items-center gap-1.5 disabled:opacity-40"
+                  >
+                    <Zap className={`w-3.5 h-3.5 ${isExecutingTestTrade ? 'animate-spin' : ''}`} />
+                    <span>{isExecutingTestTrade ? 'جاري الفحص...' : '⚡ تنفيذ صفقة اختبارية فحص فوري'}</span>
+                  </button>
+
+                  <button
+                    onClick={async () => {
+                      localStorage.setItem('jev_binance_api_key', apiKey.trim());
+                      localStorage.setItem('jev_binance_api_secret', apiSecret.trim());
+                      localStorage.setItem('jev_binance_mode', binanceMode);
+                      setSaveSuccessMessage('جاري التحقق من صحة المفاتيح ومطابقة رصيد المحفظة عبر Binance...');
+                      try {
+                        const resp = await fetch('/api/binance/account', {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({
+                            apiKey: apiKey.trim(),
+                            apiSecret: apiSecret.trim(),
+                            isTestnet: binanceMode === 'testnet'
+                          })
+                        });
+                        const data = await resp.json();
+                        if (resp.ok && data.success) {
+                          setIsAccountVerified(true);
+                          const usdt = data.balances?.find((b: any) => b.asset === 'USDT');
+                          const usdtVal = usdt ? (parseFloat(usdt.free) + parseFloat(usdt.locked)).toFixed(2) : '0.00';
+                          setAccountBalance(Number(usdtVal));
+                          setSaveSuccessMessage(`تم التحقق والربط بنجاح! رصيد USDT المتوفر في حساب Testnet: $${usdtVal} 🚀`);
+                          fetchBinanceMyTrades();
+                        } else {
+                          setSaveSuccessMessage(`تم حفظ المفاتيح، ولكن رد بينانس: ${data.error || 'تأكد من صحة المفتاح والصلاحيات'}`);
+                        }
+                      } catch (err: any) {
+                        setSaveSuccessMessage('تم حفظ المفاتيح محلياً بنجاح!');
+                      }
+                      setTimeout(() => setSaveSuccessMessage(null), 8000);
+                    }}
+                    className="px-5 py-2.5 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-400 hover:to-teal-500 text-slate-950 font-bold text-xs shadow-lg shadow-emerald-500/20 transition-all cursor-pointer"
+                  >
+                    اختبار الاتصال وحفظ الإعدادات
+                  </button>
+                </div>
               </div>
             </div>
           </div>

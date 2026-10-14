@@ -2,6 +2,7 @@ import express from 'express';
 import dotenv from 'dotenv';
 import path from 'path';
 import fs from 'fs';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 
 dotenv.config();
@@ -204,6 +205,441 @@ app.get('/api/binance/tickers', async (req, res) => {
     res.json(results);
   } catch (error: any) {
     res.status(500).json({ error: 'Failed to fetch Binance tickers', details: error.message });
+  }
+});
+
+// In-memory cache for klines to provide instant responses and prevent Binance rate limits
+// Distinguish between latest klines (TTL: 4s) and historical closed blocks (TTL: 24h)
+const klinesCache = new Map<string, { timestamp: number; data: any }>();
+const LATEST_KLINES_CACHE_TTL_MS = 4000;
+const HISTORICAL_KLINES_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+// API: Fetch authentic Binance klines (candlesticks + volume) for TradingView Chart
+app.get('/api/binance/klines', async (req, res) => {
+  try {
+    const symbol = (typeof req.query.symbol === 'string' ? req.query.symbol : 'BTCUSDT').replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+    const interval = typeof req.query.interval === 'string' ? req.query.interval : '15m';
+    const limit = Math.min(Math.max(Number(req.query.limit) || 150, 10), 1000);
+
+    // End time support for historical pagination
+    let endTime: number | undefined = undefined;
+    if (req.query.endTime) {
+      const num = Number(req.query.endTime);
+      if (!isNaN(num) && num > 0) {
+        endTime = num < 1e11 ? num * 1000 : num; // ensure ms
+      }
+    }
+
+    let startTime: number | undefined = undefined;
+    if (req.query.startTime) {
+      const num = Number(req.query.startTime);
+      if (!isNaN(num) && num > 0) {
+        startTime = num < 1e11 ? num * 1000 : num;
+      }
+    }
+
+    const isHistorical = endTime !== undefined;
+    const cacheKey = `${symbol}_${interval}_${limit}_${endTime || 'latest'}_${startTime || ''}`;
+
+    const cached = klinesCache.get(cacheKey);
+    const ttl = isHistorical ? HISTORICAL_KLINES_CACHE_TTL_MS : LATEST_KLINES_CACHE_TTL_MS;
+    if (cached && Date.now() - cached.timestamp < ttl) {
+      return res.json(cached.data);
+    }
+
+    let queryParams = `symbol=${symbol}&interval=${interval}&limit=${limit}`;
+    if (endTime) queryParams += `&endTime=${endTime}`;
+    if (startTime) queryParams += `&startTime=${startTime}`;
+
+    let url = `https://api.binance.com/api/v3/klines?${queryParams}`;
+    let resp = await fetch(url);
+    if (!resp.ok) {
+      url = `https://testnet.binance.vision/api/v3/klines?${queryParams}`;
+      resp = await fetch(url);
+    }
+
+    if (!resp.ok) {
+      if (cached) return res.json(cached.data);
+      return res.status(resp.status).json({ error: 'Failed to fetch klines from Binance' });
+    }
+
+    const rawKlines = await resp.json();
+    if (!Array.isArray(rawKlines)) {
+      if (cached) return res.json(cached.data);
+      return res.status(500).json({ error: 'Invalid response from Binance klines' });
+    }
+
+    const candles = rawKlines.map((k: any) => ({
+      time: Math.floor(Number(k[0]) / 1000),
+      open: parseFloat(k[1]),
+      high: parseFloat(k[2]),
+      low: parseFloat(k[3]),
+      close: parseFloat(k[4]),
+    }));
+
+    const volumes = rawKlines.map((k: any) => {
+      const open = parseFloat(k[1]);
+      const close = parseFloat(k[4]);
+      return {
+        time: Math.floor(Number(k[0]) / 1000),
+        value: parseFloat(k[5]),
+        color: close >= open ? 'rgba(16, 185, 129, 0.4)' : 'rgba(244, 63, 94, 0.4)',
+      };
+    });
+
+    const payload = {
+      symbol,
+      interval,
+      candles,
+      volumes,
+      hasMore: candles.length === limit,
+      oldestTime: candles.length > 0 ? candles[0].time : null,
+      newestTime: candles.length > 0 ? candles[candles.length - 1].time : null,
+    };
+
+    klinesCache.set(cacheKey, { timestamp: Date.now(), data: payload });
+    res.json(payload);
+  } catch (error: any) {
+    res.status(500).json({ error: 'Internal kline error', details: error.message });
+  }
+});
+
+// API: Check Binance account balances & verify API Key
+app.post('/api/binance/account', async (req, res) => {
+  try {
+    const { apiKey, apiSecret, isTestnet = true } = req.body;
+    if (!apiKey || !apiSecret) {
+      return res.status(400).json({ error: 'API Key and Secret Key are required' });
+    }
+
+    const baseUrl = isTestnet ? 'https://testnet.binance.vision' : 'https://api.binance.com';
+    const timestamp = Date.now();
+    const queryString = `timestamp=${timestamp}&recvWindow=10000`;
+    const signature = crypto.createHmac('sha256', apiSecret).update(queryString).digest('hex');
+
+    const resp = await fetch(`${baseUrl}/api/v3/account?${queryString}&signature=${signature}`, {
+      method: 'GET',
+      headers: {
+        'X-MBX-APIKEY': apiKey,
+      },
+    });
+
+    const data = await resp.json();
+    if (!resp.ok) {
+      return res.status(resp.status).json({
+        error: data.msg || 'Binance Account API error',
+        code: data.code,
+        details: data
+      });
+    }
+
+    const relevantSymbols = ['USDT', 'BTC', 'ETH', 'SOL', 'BNB'];
+    const balances = (data.balances || []).filter((b: any) => 
+      relevantSymbols.includes(b.asset) || parseFloat(b.free) > 0 || parseFloat(b.locked) > 0
+    );
+
+    res.json({
+      success: true,
+      canTrade: data.canTrade,
+      accountType: data.accountType,
+      balances,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// API: Fetch actual executed trades & orders from Binance
+app.post('/api/binance/my-trades', async (req, res) => {
+  try {
+    const { apiKey, apiSecret, symbol = 'BTCUSDT', isTestnet = true } = req.body;
+    if (!apiKey || !apiSecret) {
+      return res.status(400).json({ error: 'API Key and Secret Key are required' });
+    }
+
+    const cleanSymbol = symbol.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+    const baseUrl = isTestnet ? 'https://testnet.binance.vision' : 'https://api.binance.com';
+    const timestamp = Date.now();
+    const queryString = `symbol=${cleanSymbol}&timestamp=${timestamp}&recvWindow=10000&limit=30`;
+    const signature = crypto.createHmac('sha256', apiSecret).update(queryString).digest('hex');
+
+    const [tradesResp, ordersResp] = await Promise.all([
+      fetch(`${baseUrl}/api/v3/myTrades?${queryString}&signature=${signature}`, {
+        headers: { 'X-MBX-APIKEY': apiKey }
+      }),
+      fetch(`${baseUrl}/api/v3/allOrders?${queryString}&signature=${signature}`, {
+        headers: { 'X-MBX-APIKEY': apiKey }
+      })
+    ]);
+
+    const tradesData = await tradesResp.json();
+    const ordersData = await ordersResp.json();
+
+    if (!tradesResp.ok && !ordersResp.ok) {
+      return res.status(400).json({
+        error: tradesData.msg || ordersData.msg || 'Failed to fetch Binance trades',
+        details: { tradesData, ordersData }
+      });
+    }
+
+    const rawTrades = Array.isArray(tradesData) ? tradesData : [];
+    const rawOrders = Array.isArray(ordersData) ? ordersData : [];
+
+    res.json({
+      success: true,
+      trades: rawTrades,
+      orders: rawOrders,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// API: Universal Real Order Execution (BUY & SELL for Take-Profit / Stop-Loss)
+app.post('/api/binance/order', async (req, res) => {
+  try {
+    const {
+      apiKey,
+      apiSecret,
+      symbol = 'BTCUSDT',
+      side = 'BUY', // 'BUY' | 'SELL'
+      quoteAmount = 15,
+      quantity,
+      reason = 'STRATEGY_SIGNAL', // '5_CONDITIONS_BUY' | 'TAKE_PROFIT' | 'STOP_LOSS' | 'MANUAL_EXIT'
+      isTestnet = true,
+      telegramConfig
+    } = req.body;
+
+    if (!apiKey || !apiSecret) {
+      return res.status(400).json({ error: 'مفتاح الـ API و Secret Key مطلوبان لتنفيذ الأوامر.' });
+    }
+
+    const cleanSymbol = symbol.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+    const baseAsset = cleanSymbol.replace(/USDT|BUSD|FDUSD|USDC/g, '');
+    const baseUrl = isTestnet ? 'https://testnet.binance.vision' : 'https://api.binance.com';
+    const timestamp = Date.now();
+    const orderSide = side.toUpperCase() === 'SELL' ? 'SELL' : 'BUY';
+
+    let queryParts = [
+      `symbol=${cleanSymbol}`,
+      `side=${orderSide}`,
+      `type=MARKET`,
+    ];
+
+    if (orderSide === 'BUY') {
+      const quoteQty = Number(quoteAmount) || 15;
+      queryParts.push(`quoteOrderQty=${quoteQty}`);
+    } else {
+      // For SELL: prefer quantity if provided, else check account free balance or quoteOrderQty
+      if (quantity && Number(quantity) > 0) {
+        queryParts.push(`quantity=${quantity}`);
+      } else if (quoteAmount && Number(quoteAmount) > 0) {
+        queryParts.push(`quoteOrderQty=${Number(quoteAmount)}`);
+      } else {
+        // Query account to find free base asset
+        const accQs = `timestamp=${Date.now()}&recvWindow=10000`;
+        const accSig = crypto.createHmac('sha256', apiSecret).update(accQs).digest('hex');
+        const accResp = await fetch(`${baseUrl}/api/v3/account?${accQs}&signature=${accSig}`, {
+          headers: { 'X-MBX-APIKEY': apiKey }
+        });
+        if (accResp.ok) {
+          const accData = await accResp.json();
+          const holding = accData.balances?.find((b: any) => b.asset === baseAsset);
+          const freeQty = parseFloat(holding?.free || '0');
+          if (freeQty > 0) {
+            queryParts.push(`quantity=${freeQty}`);
+          } else {
+            queryParts.push(`quoteOrderQty=15`);
+          }
+        } else {
+          queryParts.push(`quoteOrderQty=15`);
+        }
+      }
+    }
+
+    queryParts.push(`timestamp=${timestamp}`);
+    queryParts.push(`recvWindow=10000`);
+
+    const queryParams = queryParts.join('&');
+    const signature = crypto.createHmac('sha256', apiSecret).update(queryParams).digest('hex');
+    const orderUrl = `${baseUrl}/api/v3/order?${queryParams}&signature=${signature}`;
+
+    const orderResp = await fetch(orderUrl, {
+      method: 'POST',
+      headers: {
+        'X-MBX-APIKEY': apiKey,
+        'Content-Type': 'application/x-www-form-urlencoded'
+      }
+    });
+
+    const orderResult = await orderResp.json();
+
+    if (!orderResp.ok) {
+      return res.status(orderResp.status).json({
+        error: orderResult.msg || `فشل تنفيذ أمر ${orderSide} في Binance`,
+        code: orderResult.code,
+        details: orderResult
+      });
+    }
+
+    const executedQty = parseFloat(orderResult.executedQty || '0');
+    const cummulativeQuoteQty = parseFloat(orderResult.cummulativeQuoteQty || '0');
+    const avgPrice = executedQty > 0 ? cummulativeQuoteQty / executedQty : 0;
+
+    // Send Telegram alert based on order reason
+    let tgSent = false;
+    if (telegramConfig?.botToken && telegramConfig?.chatId) {
+      try {
+        let reasonLabel = '⚡ تنفيذ أمر مباشر';
+        let actionIcon = orderSide === 'BUY' ? '🟢' : '🔴';
+        let reasonTitle = 'تداول آلي';
+
+        if (reason === '5_CONDITIONS_BUY') {
+          reasonTitle = '🟢 تم تفعيل الشراء لاكتمال الشروط الـ 5 بنجاح';
+          reasonLabel = 'شراء وتجميع Spot (Auto-Buy)';
+        } else if (reason === 'TAKE_PROFIT') {
+          reasonTitle = '🎯 تم تحقيق الهدف (Take Profit) والبيع بربح!';
+          reasonLabel = 'بيع وإغلاق بربح (Take-Profit)';
+        } else if (reason === 'STOP_LOSS') {
+          reasonTitle = '🛡️ تم تفعيل وقف الخسارة (Stop Loss) لحماية المحفظة!';
+          reasonLabel = 'بيع حماية رأس المال (Stop-Loss)';
+        } else if (reason === 'MANUAL_EXIT') {
+          reasonTitle = '💵 إغلاق الصفقة والتحول للكاش 100% USDT';
+          reasonLabel = 'بيع فوري يدوي';
+        }
+
+        const tgMessage = `${actionIcon} <b>[Binance Testnet | ${reasonTitle}]</b>
+━━━━━━━━━━━━━━━━━━━━
+📌 الزوج: <b>${cleanSymbol}</b>
+🏷️ نوع العملية: <b>${orderSide === 'BUY' ? 'شراء Spot' : 'بيع وتحول للكاش 100% USDT'}</b>
+📝 السبب: <b>${reasonLabel}</b>
+🔢 رقم الأمر: <code>#${orderResult.orderId}</code>
+💵 القيمة: <b>$${cummulativeQuoteQty.toFixed(2)} USDT</b>
+📦 الكمية المنفذة: <b>${executedQty} ${baseAsset}</b>
+📈 متوسط سعر التنفيذ: <b>$${avgPrice.toLocaleString()}</b>
+⏱️ التوقيت: <b>${new Date(orderResult.transactTime || Date.now()).toLocaleTimeString()}</b>
+📊 وضع البوت: <b>تداول آلي نشط 24/7 🚀</b>`;
+
+        await fetch(`https://api.telegram.org/bot${telegramConfig.botToken}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: telegramConfig.chatId,
+            text: tgMessage,
+            parse_mode: 'HTML'
+          })
+        });
+        tgSent = true;
+      } catch (tgErr) {
+        console.warn('Telegram notification failed:', tgErr);
+      }
+    }
+
+    res.json({
+      success: true,
+      side: orderSide,
+      reason,
+      order: orderResult,
+      executedPrice: avgPrice,
+      executedQty,
+      cummulativeQuoteQty,
+      orderId: orderResult.orderId,
+      telegramSent: tgSent,
+      timestamp: new Date(orderResult.transactTime || Date.now()).toLocaleTimeString()
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Internal order execution error', details: err.message });
+  }
+});
+
+// Alias for Instant Test Trade Execution with Telegram Notification
+app.post('/api/binance/test-trade', async (req, res) => {
+  try {
+    const { apiKey, apiSecret, symbol = 'BTCUSDT', quoteAmount = 15, isTestnet = true, telegramConfig } = req.body;
+    if (!apiKey || !apiSecret) {
+      return res.status(400).json({ error: 'مفتاح الـ API و Secret Key مطلوبان لتنفيذ الصفقة الاختبارية.' });
+    }
+
+    const cleanSymbol = symbol.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+    const baseUrl = isTestnet ? 'https://testnet.binance.vision' : 'https://api.binance.com';
+    const timestamp = Date.now();
+    const quoteQty = Number(quoteAmount) || 15;
+
+    const queryParams = [
+      `symbol=${cleanSymbol}`,
+      `side=BUY`,
+      `type=MARKET`,
+      `quoteOrderQty=${quoteQty}`,
+      `timestamp=${timestamp}`,
+      `recvWindow=10000`
+    ].join('&');
+
+    const signature = crypto.createHmac('sha256', apiSecret).update(queryParams).digest('hex');
+    const orderUrl = `${baseUrl}/api/v3/order?${queryParams}&signature=${signature}`;
+
+    const orderResp = await fetch(orderUrl, {
+      method: 'POST',
+      headers: {
+        'X-MBX-APIKEY': apiKey,
+        'Content-Type': 'application/x-www-form-urlencoded'
+      }
+    });
+
+    const orderResult = await orderResp.json();
+
+    if (!orderResp.ok) {
+      return res.status(orderResp.status).json({
+        error: orderResult.msg || 'فشل تنفيذ الأمر في Binance Testnet',
+        code: orderResult.code,
+        details: orderResult
+      });
+    }
+
+    const executedQty = parseFloat(orderResult.executedQty || '0');
+    const cummulativeQuoteQty = parseFloat(orderResult.cummulativeQuoteQty || '0');
+    const avgPrice = executedQty > 0 ? cummulativeQuoteQty / executedQty : 0;
+
+    let tgSent = false;
+    if (telegramConfig?.botToken && telegramConfig?.chatId) {
+      try {
+        const tgMessage = `⚡ <b>[Binance Testnet | تم تنفيذ صفقة اختبارية حقيقية بنجاح]</b>
+━━━━━━━━━━━━━━━━━━━━
+📌 الزوج: <b>${cleanSymbol}</b>
+🏷️ النوع: <b>شراء فوري (Market BUY)</b>
+🔢 رقم الأمر: <code>#${orderResult.orderId}</code>
+💵 المبلغ المصروف: <b>$${cummulativeQuoteQty.toFixed(2)} USDT</b>
+📦 الكمية المنفذة: <b>${executedQty} ${cleanSymbol.replace('USDT', '')}</b>
+📈 متوسط سعر الشراء: <b>$${avgPrice.toLocaleString()}</b>
+⏱️ التوقيت: <b>${new Date(orderResult.transactTime || Date.now()).toLocaleTimeString()}</b>
+🟢 حالة الحساب: <b>متصل وجاهز للتداول الآلي 🚀</b>`;
+
+        await fetch(`https://api.telegram.org/bot${telegramConfig.botToken}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: telegramConfig.chatId,
+            text: tgMessage,
+            parse_mode: 'HTML'
+          })
+        });
+        tgSent = true;
+      } catch (tgErr) {
+        console.warn('Telegram notification failed during test trade:', tgErr);
+      }
+    }
+
+    res.json({
+      success: true,
+      order: orderResult,
+      executedPrice: avgPrice,
+      executedQty,
+      cummulativeQuoteQty,
+      orderId: orderResult.orderId,
+      telegramSent: tgSent,
+      timestamp: new Date(orderResult.transactTime || Date.now()).toLocaleTimeString()
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Internal test trade error', details: err.message });
   }
 });
 

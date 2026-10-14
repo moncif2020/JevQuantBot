@@ -1,6 +1,6 @@
 {
-  "summary":  "Implementation plan for integrating JevPaperDatabase real-time logging into standalone_backtester.py and adding server API endpoints in server.ts",
-  "updatedAt":  "2026-10-12T00:19:15.459149372Z",
-  "requestFeedback":  true,
-  "userFacing":  true
+  "summary": "خطة معمارية تفصيلية لتوسيع سجل شموع الشارت من 120 شمعة إلى سجل تاريخي متكامل يمتد من سنتين إلى 5 سنوات حسب تقسيم الفريمات الزمني المعتمد، مع دعم العرض اللحظي الأولي (1000 شمعة) والاستكمال المتسلسل في الخلفية (Background Backfill)، وتأمين كامل ضد حظر IP بينانس عبر التخزين المؤقت والتجزئة الزمنية.",
+  "updatedAt": "2026-10-14T18:32:46.853275401Z",
+  "requestFeedback": true,
+  "userFacing": true
 }
