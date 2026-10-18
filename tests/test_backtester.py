@@ -228,7 +228,7 @@ class TestBacktesterV01Integrity(unittest.TestCase):
         Verify that missing, non-positive, or invalid ATR and invalid close strictly block BUY signals.
         """
         engine = StandaloneBacktester(initial_capital=10000.0, symbol="BTCUSDT")
-        
+
         # Test close <= 0
         bad_close_candles = [
             Candle(timestamp=1000 + i * 900000, open_=100.0, high=110.0, low=90.0, close=0.0 if i == 35 else 100.0, volume=10.0)
@@ -289,7 +289,7 @@ class TestBacktesterV01Integrity(unittest.TestCase):
         4. Target allocation scales with conviction and confidence.
         """
         entry_rules = self.rules.entry_rules
-        
+
         # Test calculate_position_size directly with 500 USDT balance:
         # Max 20% = 500 * 0.20 = 100.0 USDT
         size_conv2 = entry_rules.calculate_position_size(current_balance=500.0, conviction=2, confidence=0.85, threshold=0.82)
