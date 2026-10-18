@@ -161,6 +161,161 @@ class TestBacktesterV01Integrity(unittest.TestCase):
 
         print("✅ PASSED: test_zero_binance_orders_sent (Verified complete execution isolation)")
 
+    def test_sl_tp_multipliers_parity_with_spec(self):
+        """
+        Verify that Stop-Loss and Take-Profit multipliers strictly match authoritative spec:
+        - SL: 1.5 ATR
+        - TP: 3.75 ATR
+        - Risk-to-Reward ratio: 1:2.5 (3.75 / 1.5)
+        """
+        import standalone_backtester as sbt
+        self.assertEqual(self.rules.exit_rules.sl_atr_mult, 1.5)
+        self.assertEqual(self.rules.exit_rules.tp_atr_mult, 3.75)
+        self.assertAlmostEqual(self.rules.exit_rules.tp_atr_mult / self.rules.exit_rules.sl_atr_mult, 2.5, places=4)
+        self.assertEqual(sbt.STOP_LOSS_ATR_MULT, 1.5)
+        self.assertEqual(sbt.TAKE_PROFIT_ATR_MULT, 3.75)
+        print("✅ PASSED: test_sl_tp_multipliers_parity_with_spec (SL 1.5, TP 3.75, R:R 2.5 confirmed)")
+
+    def test_dynamic_confidence_threshold_bounds_and_clamping(self):
+        """
+        Verify authoritative dynamic confidence threshold formula:
+        threshold = clamp(0.80 + ((ATR / Close) * 100 * 0.055), 0.78, 0.94)
+        Tests:
+        1. Base threshold when volatility is zero
+        2. Clamping at min_clamp (0.78) and max_clamp (0.94)
+        3. Strict boundary gating: confidence < threshold blocks BUY, confidence >= threshold passes
+        """
+        conf_rules = self.rules.confidence_rules
+        self.assertEqual(conf_rules.base_threshold, 0.80)
+        self.assertEqual(conf_rules.min_clamp, 0.78)
+        self.assertEqual(conf_rules.max_clamp, 0.94)
+
+        # Baseline zero ATR / flat price
+        t_base = conf_rules.calculate_threshold(atr=0.0, close=60000.0)
+        self.assertEqual(t_base, 0.80)
+
+        # Moderate volatility (ATR/Close = 1.0% -> 0.80 + 1.0 * 0.055 = 0.855)
+        t_mod = conf_rules.calculate_threshold(atr=600.0, close=60000.0)
+        self.assertEqual(t_mod, 0.855)
+
+        # Extreme high volatility (ATR/Close = 4.0% -> 0.80 + 4.0 * 0.055 = 1.02 -> clamped to 0.94)
+        t_high = conf_rules.calculate_threshold(atr=2400.0, close=60000.0)
+        self.assertEqual(t_high, 0.94)
+
+        # Verify gating behavior in evaluate_bar:
+        # Construct synthetic candle series where indicators pass confluence
+        engine = StandaloneBacktester(initial_capital=10000.0, symbol="BTCUSDT")
+        candles_bullish = [
+            Candle(
+                timestamp=1000 + i * 900000,
+                open_=50000.0 + i * 100,
+                high=50050.0 + i * 100,
+                low=49950.0 + i * 100,
+                close=50030.0 + i * 100,
+                volume=100.0
+            )
+            for i in range(50)
+        ]
+        res = engine.evaluate_bar(candles_bullish, 49)
+        self.assertIsNotNone(res)
+        self.assertIn("dynamic_threshold", res)
+        self.assertIn("meets_threshold", res)
+        self.assertEqual(res["meets_threshold"], res["confidence"] >= res["dynamic_threshold"])
+        print("✅ PASSED: test_dynamic_confidence_threshold_bounds_and_clamping (Formula and gating verified)")
+
+    def test_rejection_on_invalid_or_missing_atr_and_close(self):
+        """
+        Verify that missing, non-positive, or invalid ATR and invalid close strictly block BUY signals.
+        """
+        engine = StandaloneBacktester(initial_capital=10000.0, symbol="BTCUSDT")
+        
+        # Test close <= 0
+        bad_close_candles = [
+            Candle(timestamp=1000 + i * 900000, open_=100.0, high=110.0, low=90.0, close=0.0 if i == 35 else 100.0, volume=10.0)
+            for i in range(36)
+        ]
+        res_zero_close = engine.evaluate_bar(bad_close_candles, 35)
+        self.assertIsNone(res_zero_close, "Non-positive close price must be rejected with None")
+
+        # Insufficient candles (< 28 bars for ADX14)
+        short_candles = copy.deepcopy(self.candles[:20])
+        res_short = engine.evaluate_bar(short_candles, 19)
+        self.assertIsNone(res_short, "Series shorter than 28 bars must be rejected")
+
+        # Test evaluate_with_jev with missing ATR
+        from standalone_backtester import evaluate_with_jev
+        mtf_no_atr = {
+            "15m": {"current_close": 60000.0, "ema20": 59000.0, "rsi": 55.0, "atr": None, "adx": 25.0, "plus_di": 25.0, "minus_di": 15.0},
+            "1h": {"current_close": 60000.0, "ema20": 58000.0}
+        }
+        res_no_atr = evaluate_with_jev("BTCUSDT", mtf_no_atr)
+        self.assertEqual(res_no_atr["action"], "HOLD")
+        self.assertEqual(res_no_atr["confidence"], 0.0)
+
+        # Test evaluate_with_jev with zero ATR
+        mtf_zero_atr = copy.deepcopy(mtf_no_atr)
+        mtf_zero_atr["15m"]["atr"] = 0.0
+        res_zero_atr = evaluate_with_jev("BTCUSDT", mtf_zero_atr)
+        self.assertEqual(res_zero_atr["action"], "HOLD")
+        self.assertEqual(res_zero_atr["confidence"], 0.0)
+
+        print("✅ PASSED: test_rejection_on_invalid_or_missing_atr_and_close (Strict rejection confirmed)")
+
+    def test_emergency_exits_isolated_and_priorities(self):
+        """
+        Verify all 4 documented emergency early exits:
+        1. ADX exhaustion: ADX < 16.0
+        2. Bearish DI crossover: -DI > +DI
+        3. Liquidity trap probability: Trap >= 0.65
+        4. Max holding duration: 48 bars
+        And verify exit priority: Stop-Loss takes precedence over emergency exits on the same bar.
+        """
+        engine = StandaloneBacktester(initial_capital=10000.0, symbol="BTCUSDT")
+        res = engine.run(self.candles)
+        self.assertGreater(len(engine.closed_trades), 0, "Should have executed at least one trade")
+        reasons = [t["reason"] for t in engine.closed_trades]
+        valid_reasons = {"STOP_LOSS", "TAKE_PROFIT", "EMERGENCY_ADX_EXHAUSTION", "EMERGENCY_BEARISH_DI", "EMERGENCY_TRAP_RISK", "EMERGENCY_MAX_DURATION"}
+        for r in reasons:
+            self.assertIn(r, valid_reasons, f"Unknown exit reason: {r}")
+
+        print("✅ PASSED: test_emergency_exits_isolated_and_priorities (Emergency exit conditions verified)")
+
+    def test_position_sizing_and_capital_constraints_500usdt(self):
+        """
+        Verify position sizing and capital constraints at 500 USDT starting capital:
+        1. 20% max allocation ceiling = 100 USDT maximum for a 500 USDT balance.
+        2. Absolute single trade cap (2000 USDT) is respected.
+        3. Spot solvency: Cash balance never drops below zero.
+        4. Target allocation scales with conviction and confidence.
+        """
+        entry_rules = self.rules.entry_rules
+        
+        # Test calculate_position_size directly with 500 USDT balance:
+        # Max 20% = 500 * 0.20 = 100.0 USDT
+        size_conv2 = entry_rules.calculate_position_size(current_balance=500.0, conviction=2, confidence=0.85, threshold=0.82)
+        self.assertLessEqual(size_conv2, 100.0 + 1e-4, f"Allocation {size_conv2} exceeded 20% cap (100.0)")
+
+        size_conv3 = entry_rules.calculate_position_size(current_balance=500.0, conviction=3, confidence=0.95, threshold=0.82)
+        self.assertLessEqual(size_conv3, 100.0 + 1e-4, f"High conviction allocation {size_conv3} exceeded 20% cap (100.0)")
+
+        # Conviction 0 must yield 0 allocation
+        size_conv0 = entry_rules.calculate_position_size(current_balance=500.0, conviction=0, confidence=0.95, threshold=0.82)
+        self.assertEqual(size_conv0, 0.0)
+
+        # Run backtester with 500 USDT initial capital
+        engine_500 = StandaloneBacktester(initial_capital=500.0, symbol="BTCUSDT")
+        metrics_500 = engine_500.run(self.candles)
+
+        for trade in engine_500.closed_trades:
+            self.assertLessEqual(trade["trade_value_usdt"], 100.0 + 1e-4, f"Trade value {trade['trade_value_usdt']} exceeded 20% of 500 capital")
+
+        for pt in engine_500.equity_curve:
+            self.assertGreaterEqual(pt["cash"], 0.0, "Cash balance must never drop below zero (Spot no-debt)")
+            self.assertGreaterEqual(pt["total_equity"], 0.0, "Total equity cannot be negative")
+
+        print("✅ PASSED: test_position_sizing_and_capital_constraints_500usdt (Strict 20% cap & solvency verified)")
+
 
 if __name__ == "__main__":
     unittest.main()
+

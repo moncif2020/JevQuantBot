@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   ShieldCheck,
   Play,
@@ -31,6 +31,50 @@ export const BacktestLabV01: React.FC<BacktestLabV01Props> = () => {
   const [candleCount, setCandleCount] = useState<number>(500);
   const [isSimulating, setIsSimulating] = useState<boolean>(false);
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
+
+  // Python code editor state
+  const [pythonCode, setPythonCode] = useState<string>('');
+  const [isFetchingPython, setIsFetchingPython] = useState<boolean>(false);
+  const [isSavingPython, setIsSavingPython] = useState<boolean>(false);
+  const [pythonSaveMsg, setPythonSaveMsg] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (subTab === 'python_code' && !pythonCode) {
+      setIsFetchingPython(true);
+      fetch('/api/python-code')
+        .then(res => res.json())
+        .then(data => {
+          if (data.code) {
+            setPythonCode(data.code);
+          }
+        })
+        .catch(err => console.error('Failed to load python code:', err))
+        .finally(() => setIsFetchingPython(false));
+    }
+  }, [subTab]);
+
+  const handleSavePythonCode = async () => {
+    setIsSavingPython(true);
+    setPythonSaveMsg(null);
+    try {
+      const res = await fetch('/api/python-code', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code: pythonCode })
+      });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        setPythonSaveMsg('تم حفظ كود بايتون وتحديث السكربت بنجاح!');
+        setTimeout(() => setPythonSaveMsg(null), 4000);
+      } else {
+        setPythonSaveMsg(data.error || 'فشل حفظ الكود');
+      }
+    } catch (err: any) {
+      setPythonSaveMsg('خطأ في الاتصال بالخادم');
+    } finally {
+      setIsSavingPython(false);
+    }
+  };
 
   // Unit tests state
   const [isRunningTests, setIsRunningTests] = useState<boolean>(false);
@@ -845,61 +889,102 @@ export const BacktestLabV01: React.FC<BacktestLabV01Props> = () => {
         </div>
       )}
 
-      {/* TAB 4: STANDALONE PYTHON SCRIPT */}
+      {/* TAB 4: STANDALONE PYTHON SCRIPT & MANUAL COIN EDITOR */}
       {subTab === 'python_code' && (
         <div className="space-y-4">
-          <div className="p-5 rounded-2xl bg-slate-900 border border-slate-800 space-y-3">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+          <div className="p-5 rounded-2xl bg-slate-900 border border-slate-800 space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
               <div>
                 <h3 className="text-sm font-bold text-white flex items-center gap-2">
                   <Terminal className="w-4 h-4 text-emerald-400" />
-                  ملف السكربت المستقل (standalone_backtester.py)
+                  محرر كود بايتون والتعديل اليدوي للعملات (standalone_backtester.py)
                 </h3>
-                <p className="text-xs text-slate-400">
-                  كود محرك المحاكاة المنعزل بالكامل بدون أي مفاتيح خاصة أو أوامر بينانس حقيقية.
+                <p className="text-xs text-slate-400 mt-0.5">
+                  يمكنك تعديل الكود البرمجي وإضافة أي عملة رقمية جديدة يدويًا للتداول عليها وحفظ التعديلات مباشرة في واجهة المستخدم.
                 </p>
               </div>
 
               <div className="flex items-center gap-2">
                 <button
-                  onClick={() => copyToClipboard(`python3 standalone_backtester.py --mode stress --capital 10000`, 'cli_cmd')}
+                  onClick={() => {
+                    const blob = new Blob([pythonCode], { type: 'text/plain;charset=utf-8' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = 'standalone_backtester.py';
+                    a.click();
+                    URL.revokeObjectURL(url);
+                  }}
                   className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-mono transition cursor-pointer"
                 >
-                  {copiedCode === 'cli_cmd' ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
-                  <span>نسخ أمر التشغيل</span>
+                  <Download className="w-3.5 h-3.5 text-cyan-400" />
+                  <span>تحميل الملف (.py)</span>
+                </button>
+
+                <button
+                  onClick={handleSavePythonCode}
+                  disabled={isSavingPython}
+                  className="flex items-center gap-1.5 px-4 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-black text-xs transition shadow-lg shadow-emerald-500/20 cursor-pointer disabled:opacity-50"
+                >
+                  {isSavingPython ? (
+                    <>
+                      <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                      <span>جاري الحفظ...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Check className="w-3.5 h-3.5" />
+                      <span>حفظ التعديلات في الخادم</span>
+                    </>
+                  )}
                 </button>
               </div>
             </div>
 
-            <div className="p-3 bg-slate-950 rounded-xl border border-slate-800 font-mono text-xs text-slate-300">
-              <span className="text-slate-500 block mb-1"># طريقة تشغيل السكربت المستقل في بيئة العمل:</span>
-              <span className="text-emerald-400 font-bold">python3 standalone_backtester.py --mode stress --capital 10000</span>
-              <span className="text-slate-500 block mt-2"># أو باستخدام بيانات حقيقية مباشرة من Binance Public:</span>
-              <span className="text-cyan-400 font-bold">python3 standalone_backtester.py --mode binance --symbol BTCUSDT</span>
+            {pythonSaveMsg && (
+              <div className={`p-3 rounded-xl text-xs font-bold flex items-center gap-2 ${pythonSaveMsg.includes('نجاح') ? 'bg-emerald-950/50 text-emerald-300 border border-emerald-500/30' : 'bg-red-950/50 text-red-300 border border-red-500/30'}`}>
+                <CheckCircle2 className="w-4 h-4 shrink-0" />
+                <span>{pythonSaveMsg}</span>
+              </div>
+            )}
+
+            <div className="p-3 bg-slate-950 rounded-xl border border-slate-800 text-xs text-slate-300 space-y-1.5 font-mono">
+              <div className="text-emerald-400 font-bold flex items-center gap-1.5">
+                <Zap className="w-3.5 h-3.5 text-amber-400" />
+                <span>طريقة إضافة عملة يدوياً في الكود:</span>
+              </div>
+              <p className="text-slate-400 text-[11px] leading-relaxed">
+                ابحث في الكود أدناه عن متغير الأصول أو عند استدعاء المحرك مثل <code className="text-cyan-300">symbol="BTCUSDT"</code> أو قائمة العملات واستبدلها بالعملة التي تريدها (مثال: <code className="text-cyan-300">symbol="ADAUSDT"</code> أو <code className="text-cyan-300">symbol="XRPUSDT"</code>). ثم اضغط على زر الحفظ أعلاه لتحديث السكربت على الخادم فوراً.
+              </p>
             </div>
 
-            <pre className="p-4 rounded-xl bg-slate-950 text-slate-300 text-[11px] font-mono overflow-x-auto leading-relaxed max-h-96 border border-slate-850">
-{`#!/usr/bin/env python3
-"""
-JevQuant Pure Standalone Backtester Engine (V0.1 Isolated Simulator)
-- 100% Isolated: Zero Binance orders sent.
-- Dual Data: Public Binance API or Synthetic Multi-Regime Stress Data.
-- Strict Lookahead Bias Prevention: Bar-by-Bar Progression.
-- Cost Model: 0.10% Binance Fees + 0.05% Slippage.
-"""
-import sys, os, math, json, csv
-from datetime import datetime, timezone
-from specs.rules_spec import StrategySpecificationV01
+            {isFetchingPython ? (
+              <div className="py-16 text-center text-slate-400 font-mono text-xs flex items-center justify-center gap-2">
+                <RefreshCw className="w-5 h-5 animate-spin text-emerald-400" />
+                <span>جاري تحميل كود بايتون من الخادم...</span>
+              </div>
+            ) : (
+              <div className="relative">
+                <textarea
+                  value={pythonCode}
+                  onChange={(e) => setPythonCode(e.target.value)}
+                  className="w-full h-[450px] p-4 rounded-xl bg-slate-950 text-emerald-300 text-xs font-mono leading-relaxed border border-slate-800 focus:outline-none focus:border-emerald-500 resize-y shadow-inner"
+                  spellCheck={false}
+                  placeholder="# Python script content..."
+                />
+              </div>
+            )}
 
-# Standalone backtester execution
-engine = StandaloneBacktester(initial_capital=10000.0, symbol="BTCUSDT")
-metrics = engine.run(candles)
-engine.export_csv("backtest_trades_v0_1.csv")
-engine.export_performance_json("backtest_performance_v0_1.json")`}
-            </pre>
+            <div className="p-3 bg-slate-950 rounded-xl border border-slate-800 flex items-center justify-between text-xs text-slate-400 font-mono">
+              <span>أمر التشغيل المباشر بعد التعديل:</span>
+              <span className="text-cyan-400 font-bold bg-slate-900 px-2.5 py-1 rounded border border-slate-800">
+                python3 standalone_backtester.py
+              </span>
+            </div>
           </div>
         </div>
       )}
     </div>
   );
 };
+

@@ -32,13 +32,106 @@ app.get('/api/status', async (req, res) => {
   }
 });
 
+const TIMEFRAME_MS: Record<string, number> = {
+  '1m': 60 * 1000,
+  '3m': 3 * 60 * 1000,
+  '5m': 5 * 60 * 1000,
+  '15m': 15 * 60 * 1000,
+  '30m': 30 * 60 * 1000,
+  '1h': 60 * 60 * 1000,
+  '2h': 2 * 60 * 60 * 1000,
+  '4h': 4 * 60 * 60 * 1000,
+  '6h': 6 * 60 * 60 * 1000,
+  '8h': 8 * 60 * 60 * 1000,
+  '12h': 12 * 60 * 60 * 1000,
+  '1d': 24 * 60 * 60 * 1000,
+  '3d': 3 * 24 * 60 * 60 * 1000,
+  '1w': 7 * 24 * 60 * 60 * 1000,
+};
+
+function resolveClosedKlines(klines: any[], referenceTimeMs?: number): any[] {
+  if (!Array.isArray(klines) || klines.length === 0) return [];
+  const refTime = typeof referenceTimeMs === 'number' ? referenceTimeMs : Date.now();
+  const closed: any[] = [];
+  for (const k of klines) {
+    if (!Array.isArray(k) || k.length < 7) continue;
+    const closeTime = Number(k[6]);
+    if (!isNaN(closeTime) && closeTime <= refTime) {
+      closed.push(k);
+    }
+  }
+  return closed;
+}
+
+function validateTimeSeriesHygiene(klines: any[], interval: string, maxGapMultiplier = 2.5): boolean {
+  if (!Array.isArray(klines) || klines.length === 0) return false;
+  const expectedStep = TIMEFRAME_MS[interval];
+  let prevOpenTime: number | null = null;
+
+  for (let i = 0; i < klines.length; i++) {
+    const k = klines[i];
+    if (!Array.isArray(k) || k.length < 7) return false;
+    const openTime = Number(k[0]);
+    const openPx = parseFloat(k[1]);
+    const highPx = parseFloat(k[2]);
+    const lowPx = parseFloat(k[3]);
+    const closePx = parseFloat(k[4]);
+    const volume = parseFloat(k[5]);
+    const closeTime = Number(k[6]);
+
+    if (isNaN(openTime) || isNaN(closeTime) || openTime <= 0 || closeTime <= openTime) return false;
+    if (isNaN(openPx) || isNaN(highPx) || isNaN(lowPx) || isNaN(closePx) || isNaN(volume)) return false;
+    if (openPx <= 0 || highPx <= 0 || lowPx <= 0 || closePx <= 0 || volume < 0) return false;
+    if (highPx < lowPx || highPx < openPx || highPx < closePx || lowPx > openPx || lowPx > closePx) return false;
+
+    if (prevOpenTime !== null) {
+      if (openTime <= prevOpenTime) return false;
+      if (expectedStep && (openTime - prevOpenTime) > expectedStep * maxGapMultiplier) {
+        return false;
+      }
+    }
+    prevOpenTime = openTime;
+  }
+  return true;
+}
+
+// Standard Exponential Moving Average (EMA) with SMA seed initialization
+function calculateEma(closes: number[], period = 20): number | null {
+  if (!closes || closes.length < period) return null;
+  const cleanCloses: number[] = [];
+  for (const c of closes) {
+    if (typeof c !== 'number' || isNaN(c) || !isFinite(c) || c <= 0) {
+      return null;
+    }
+    cleanCloses.push(c);
+  }
+  if (cleanCloses.length < period) return null;
+
+  const alpha = 2.0 / (period + 1.0);
+  let ema = cleanCloses.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < cleanCloses.length; i++) {
+    ema = cleanCloses[i] * alpha + ema * (1.0 - alpha);
+  }
+  return Number(ema.toFixed(2));
+}
+
 // Mathematical Technical Indicator Calculations (Pure Wilder Smoothing)
-function calculateWilderRsi(closes: number[], period = 14): number {
-  if (closes.length < period + 1) return 50.0;
+function calculateWilderRsi(closes: number[], period = 14): number | null {
+  if (!closes || closes.length < period + 1) return null;
+  const cleanCloses: number[] = [];
+  for (const c of closes) {
+    const val = Number(c);
+    if (!Number.isFinite(val) || val <= 0) {
+      return null;
+    }
+    cleanCloses.push(val);
+  }
+  if (cleanCloses.length < period + 1) return null;
+
   const gains: number[] = [];
   const losses: number[] = [];
-  for (let i = 1; i < closes.length; i++) {
-    const diff = closes[i] - closes[i - 1];
+  for (let i = 1; i < cleanCloses.length; i++) {
+    const diff = cleanCloses[i] - cleanCloses[i - 1];
     gains.push(Math.max(diff, 0));
     losses.push(Math.max(-diff, 0));
   }
@@ -50,26 +143,52 @@ function calculateWilderRsi(closes: number[], period = 14): number {
     avgLoss = (avgLoss * (period - 1) + losses[i]) / period;
   }
 
+  if (avgLoss === 0 && avgGain === 0) return 50.0;
   if (avgLoss === 0) return 100.0;
+  if (avgGain === 0) return 0.0;
+
   const rs = avgGain / avgLoss;
   const rsi = 100.0 - (100.0 / (1.0 + rs));
   return Number(rsi.toFixed(2));
 }
 
-function calculateAtr(highs: number[], lows: number[], closes: number[], period = 14): number {
-  if (closes.length < period + 1) {
-    return Number((highs[highs.length - 1] - lows[lows.length - 1]).toFixed(2));
+function calculateAtr(highs: number[], lows: number[], closes: number[], period = 14): number | null {
+  if (!highs || !lows || !closes) return null;
+  if (highs.length !== lows.length || lows.length !== closes.length) return null;
+  if (closes.length < period + 1) return null;
+
+  const cleanHighs: number[] = [];
+  const cleanLows: number[] = [];
+  const cleanCloses: number[] = [];
+
+  for (let i = 0; i < closes.length; i++) {
+    const h = Number(highs[i]);
+    const l = Number(lows[i]);
+    const c = Number(closes[i]);
+    if (!Number.isFinite(h) || !Number.isFinite(l) || !Number.isFinite(c)) return null;
+    if (h <= 0 || l <= 0 || c <= 0) return null;
+    if (h < l) return null;
+    cleanHighs.push(h);
+    cleanLows.push(l);
+    cleanCloses.push(c);
   }
-  const trAll: number[] = [];
-  for (let i = 1; i < closes.length; i++) {
-    const h = highs[i];
-    const l = lows[i];
-    const pc = closes[i - 1];
+
+  if (cleanCloses.length < period + 1) return null;
+
+  const trList: number[] = [];
+  for (let i = 1; i < cleanCloses.length; i++) {
+    const h = cleanHighs[i];
+    const l = cleanLows[i];
+    const pc = cleanCloses[i - 1];
     const tr = Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc));
-    trAll.push(tr);
+    trList.push(tr);
   }
-  const slice = trAll.slice(-period);
-  const atr = slice.reduce((a, b) => a + b, 0) / period;
+
+  let atr = trList.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < trList.length; i++) {
+    atr = (atr * (period - 1) + trList[i]) / period;
+  }
+
   return Number(atr.toFixed(2));
 }
 
@@ -79,21 +198,41 @@ function calculateAdx(
   lows: number[],
   closes: number[],
   period = 14
-): { adx: number; plusDi: number; minusDi: number } {
+): { adx: number; plusDi: number; minusDi: number } | null {
+  if (!highs || !lows || !closes) return null;
+  if (highs.length !== lows.length || lows.length !== closes.length) return null;
   if (closes.length < period * 2) {
-    return { adx: 22.0, plusDi: 24.0, minusDi: 18.0 };
+    return null; // ADX requires at least 2 * period candles (28 for period 14)
+  }
+
+  const cleanHighs: number[] = [];
+  const cleanLows: number[] = [];
+  const cleanCloses: number[] = [];
+
+  for (let i = 0; i < closes.length; i++) {
+    const h = Number(highs[i]);
+    const l = Number(lows[i]);
+    const c = Number(closes[i]);
+
+    if (!Number.isFinite(h) || !Number.isFinite(l) || !Number.isFinite(c)) return null;
+    if (h <= 0 || l <= 0 || c <= 0) return null;
+    if (h < l) return null; // Geometric violation
+
+    cleanHighs.push(h);
+    cleanLows.push(l);
+    cleanCloses.push(c);
   }
 
   const tr: number[] = [];
   const plusDm: number[] = [];
   const minusDm: number[] = [];
 
-  for (let i = 1; i < closes.length; i++) {
-    const h = highs[i];
-    const l = lows[i];
-    const ph = highs[i - 1];
-    const pl = lows[i - 1];
-    const pc = closes[i - 1];
+  for (let i = 1; i < cleanCloses.length; i++) {
+    const h = cleanHighs[i];
+    const l = cleanLows[i];
+    const ph = cleanHighs[i - 1];
+    const pl = cleanLows[i - 1];
+    const pc = cleanCloses[i - 1];
 
     tr.push(Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc)));
 
@@ -113,7 +252,7 @@ function calculateAdx(
     }
   }
 
-  // Initial sum for the first period
+  // Initial sum for the first period (Wilder initial seed)
   let trSmoothed = tr.slice(0, period).reduce((a, b) => a + b, 0);
   let plusDmSmoothed = plusDm.slice(0, period).reduce((a, b) => a + b, 0);
   let minusDmSmoothed = minusDm.slice(0, period).reduce((a, b) => a + b, 0);
@@ -144,12 +283,7 @@ function calculateAdx(
   }
 
   if (dxList.length < period) {
-    const avgDx = dxList.reduce((a, b) => a + b, 0) / dxList.length;
-    return {
-      adx: Number(avgDx.toFixed(1)),
-      plusDi: Number(currentPlusDi.toFixed(1)),
-      minusDi: Number(currentMinusDi.toFixed(1))
-    };
+    return null; // ADX requires at least 14 DX values to compute the seed
   }
 
   let adx = dxList.slice(0, period).reduce((a, b) => a + b, 0) / period;
@@ -175,9 +309,9 @@ app.get('/api/binance/tickers', async (req, res) => {
           fetch(`https://api.binance.com/api/v3/klines?symbol=${s}&interval=1h&limit=50`)
         ]);
         const ticker = await tickerResp.json();
-        let rsi = 60.0;
-        let atr = 100.0;
-        let adxData = { adx: 24.0, plusDi: 26.0, minusDi: 18.0 };
+        let rsi: number | null = null;
+        let atr: number | null = null;
+        let adxData: { adx: number; plusDi: number; minusDi: number } | null = null;
         if (klinesResp.ok) {
           const klines = await klinesResp.json();
           if (Array.isArray(klines) && klines.length > 15) {
@@ -193,9 +327,9 @@ app.get('/api/binance/tickers', async (req, res) => {
           ...ticker,
           rsi,
           atr,
-          adx: adxData.adx,
-          plusDi: adxData.plusDi,
-          minusDi: adxData.minusDi
+          adx: adxData ? adxData.adx : null,
+          plusDi: adxData ? adxData.plusDi : null,
+          minusDi: adxData ? adxData.minusDi : null
         };
       } catch (err: any) {
         return { symbol: s, error: err.message };
@@ -307,7 +441,14 @@ app.get('/api/binance/klines', async (req, res) => {
 // API: Check Binance account balances & verify API Key
 app.post('/api/binance/account', async (req, res) => {
   try {
-    const { apiKey, apiSecret, isTestnet = true } = req.body;
+    const {
+      apiKey,
+      apiSecret,
+      isTestnet = true,
+      showAllTestnetTokens = false,
+      activeAssets
+    } = req.body;
+
     if (!apiKey || !apiSecret) {
       return res.status(400).json({ error: 'API Key and Secret Key are required' });
     }
@@ -333,10 +474,84 @@ app.post('/api/binance/account', async (req, res) => {
       });
     }
 
-    const relevantSymbols = ['USDT', 'BTC', 'ETH', 'SOL', 'BNB'];
-    const balances = (data.balances || []).filter((b: any) => 
-      relevantSymbols.includes(b.asset) || parseFloat(b.free) > 0 || parseFloat(b.locked) > 0
+    // Only the actual trading currencies of the bot (USDT, BTC, ETH, SOL and BNB for Binance fee discount)
+    const targetAssets = Array.isArray(activeAssets) && activeAssets.length > 0
+      ? activeAssets.map((a: string) => String(a).trim().toUpperCase())
+      : ['USDT', 'BTC', 'ETH', 'SOL', 'BNB'];
+
+    const rawBalances = data.balances || [];
+    // 1. Strictly filter only valid standard crypto ticker symbols (A-Z, not Chinese characters or pure numbers like '这是测试币' or '456')
+    const validSymbolRegex = /^[A-Z][A-Z0-9]{1,9}$/;
+    const candidateBalances = rawBalances.filter((b: any) => {
+      const free = parseFloat(b.free) || 0;
+      const locked = parseFloat(b.locked) || 0;
+      const total = free + locked;
+      if (total <= 0.00000001) return false;
+
+      const asset = String(b.asset || '').trim().toUpperCase();
+      if (!validSymbolRegex.test(asset)) return false;
+      // Exclude obvious testnet spam/mock tickers
+      if (['TEST', 'DUMMY', 'FAKE', 'MOCK', 'SAMPLE'].includes(asset)) return false;
+
+      // Filter out unwanted coins - only keep the user's actual active coins
+      if (!showAllTestnetTokens && !targetAssets.includes(asset)) {
+        return false;
+      }
+      return true;
+    });
+
+    const priceMap: Record<string, number> = {
+      USDT: 1.0,
+      BUSD: 1.0,
+      USDC: 1.0,
+      FDUSD: 1.0,
+      DAI: 1.0,
+      TUSD: 1.0,
+    };
+
+    // 2. Query live real spot prices for candidate assets
+    await Promise.all(
+      candidateBalances.map(async (b: any) => {
+        const asset = b.asset.toUpperCase();
+        if (priceMap[asset] !== undefined) return;
+        try {
+          const pResp = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${asset}USDT`);
+          if (pResp.ok) {
+            const pData = await pResp.json();
+            const px = parseFloat(pData.price);
+            if (!isNaN(px) && px > 0) {
+              priceMap[asset] = px;
+            }
+          }
+        } catch (e) {
+          // Ignore individual price lookup failure
+        }
+      })
     );
+
+    // 3. Strictly retain only assets with verified non-zero market price and value > $0.01
+    const balances = candidateBalances
+      .map((b: any) => {
+        const asset = b.asset.toUpperCase();
+        const free = parseFloat(b.free) || 0;
+        const locked = parseFloat(b.locked) || 0;
+        const total = free + locked;
+        const priceUsdt = priceMap[asset] ?? 0;
+        const totalUsdtValue = total * priceUsdt;
+
+        return {
+          asset,
+          free,
+          locked,
+          total,
+          priceUsdt,
+          totalUsdtValue,
+        };
+      })
+      .filter((b: any) => {
+        // Exclude tokens that have $0.00 price or no tradable value on Binance
+        return b.priceUsdt > 0 && b.totalUsdtValue > 0.01;
+      });
 
     res.json({
       success: true,
@@ -508,7 +723,8 @@ app.post('/api/binance/order', async (req, res) => {
           reasonLabel = 'بيع فوري يدوي';
         }
 
-        const tgMessage = `${actionIcon} <b>[Binance Testnet | ${reasonTitle}]</b>
+        const modeName = isTestnet ? 'Binance Testnet' : 'Binance Spot Live الحقيقي';
+        const tgMessage = `${actionIcon} <b>[${modeName} | ${reasonTitle}]</b>
 ━━━━━━━━━━━━━━━━━━━━
 📌 الزوج: <b>${cleanSymbol}</b>
 🏷️ نوع العملية: <b>${orderSide === 'BUY' ? 'شراء Spot' : 'بيع وتحول للكاش 100% USDT'}</b>
@@ -588,8 +804,9 @@ app.post('/api/binance/test-trade', async (req, res) => {
     const orderResult = await orderResp.json();
 
     if (!orderResp.ok) {
+      const modeTitle = isTestnet ? 'Binance Testnet' : 'Binance Spot Live';
       return res.status(orderResp.status).json({
-        error: orderResult.msg || 'فشل تنفيذ الأمر في Binance Testnet',
+        error: orderResult.msg || `فشل تنفيذ الأمر في ${modeTitle}`,
         code: orderResult.code,
         details: orderResult
       });
@@ -602,7 +819,8 @@ app.post('/api/binance/test-trade', async (req, res) => {
     let tgSent = false;
     if (telegramConfig?.botToken && telegramConfig?.chatId) {
       try {
-        const tgMessage = `⚡ <b>[Binance Testnet | تم تنفيذ صفقة اختبارية حقيقية بنجاح]</b>
+        const modeTitle = isTestnet ? 'Binance Testnet' : 'Binance Spot Live الحقيقي';
+        const tgMessage = `⚡ <b>[${modeTitle} | تم تنفيذ صفقة اختبارية حقيقية بنجاح]</b>
 ━━━━━━━━━━━━━━━━━━━━
 📌 الزوج: <b>${cleanSymbol}</b>
 🏷️ النوع: <b>شراء فوري (Market BUY)</b>
@@ -656,42 +874,60 @@ app.get('/api/binance/mtf-state', async (req, res) => {
         const resp = await fetch(url);
         if (!resp.ok) return;
         const klines = await resp.json();
-        if (!Array.isArray(klines) || klines.length < 15) return;
+        if (!Array.isArray(klines) || klines.length === 0) return;
 
-        const closes = klines.map((k: any) => parseFloat(k[4]));
-        const highs = klines.map((k: any) => parseFloat(k[2]));
-        const lows = klines.map((k: any) => parseFloat(k[3]));
-        const volumes = klines.map((k: any) => parseFloat(k[5]));
+        // 1. تحديد الشموع المؤكدة الإغلاق بناءً على وقت إغلاق الشمعة k[6]
+        const closedKlines = resolveClosedKlines(klines, Date.now());
+        if (closedKlines.length < 20) return;
 
-        const currentClose = closes[closes.length - 1];
-        const ema20 = Number((closes.slice(-20).reduce((a, b) => a + b, 0) / Math.min(closes.length, 20)).toFixed(2));
-        const rsi = calculateWilderRsi(closes, 14);
-        const atr = calculateAtr(highs, lows, closes, 14);
-        const adxInfo = calculateAdx(highs, lows, closes, 14);
+        // 2. فحص سلامة السلسلة الزمنية (Time-Series Hygiene Guard)
+        if (!validateTimeSeriesHygiene(closedKlines, tf)) return;
+
+        // 3. توحيد مجموعة الشموع المغلقة لكافة المؤشرات
+        const closedCloses = closedKlines.map((k: any) => parseFloat(k[4]));
+        const closedHighs = closedKlines.map((k: any) => parseFloat(k[2]));
+        const closedLows = closedKlines.map((k: any) => parseFloat(k[3]));
+        const closedVolumes = closedKlines.map((k: any) => parseFloat(k[5]));
+
+        const currentClose = parseFloat(klines[klines.length - 1][4]);
+        const confirmedClosedClose = closedCloses[closedCloses.length - 1];
+
+        const ema20 = calculateEma(closedCloses, 20);
+        const rsi = calculateWilderRsi(closedCloses, 14);
+        const atr = calculateAtr(closedHighs, closedLows, closedCloses, 14);
+        const adxInfo = calculateAdx(closedHighs, closedLows, closedCloses, 14);
         
-        const recentVols = volumes.slice(-10);
+        const recentVols = closedVolumes.slice(-10);
         const avgVol = recentVols.reduce((a, b) => a + b, 0) / recentVols.length;
-        const volumeSpike = volumes[volumes.length - 1] > avgVol * 1.5;
+        const volumeSpike = closedVolumes[closedVolumes.length - 1] > avgVol * 1.5;
 
         let trend: 'BULLISH' | 'BEARISH' | 'NEUTRAL' = 'NEUTRAL';
-        if (currentClose > ema20 && rsi > 50) trend = 'BULLISH';
-        else if (currentClose < ema20 && rsi < 50) trend = 'BEARISH';
+        if (ema20 !== null && rsi !== null) {
+          if (confirmedClosedClose > ema20 && rsi > 50) trend = 'BULLISH';
+          else if (confirmedClosedClose < ema20 && rsi < 50) trend = 'BEARISH';
+        }
 
         let momentum = 'Normal Movement';
-        if (volumeSpike && currentClose > ema20) momentum = 'Volume Breakout';
-        else if (rsi > 70) momentum = 'Overbought Expansion';
-        else if (rsi < 30) momentum = 'Oversold Dip';
-        else if (currentClose > ema20) momentum = 'EMA 20 Support Bounce';
-        else momentum = 'EMA 20 Resistance Pressure';
+        if (ema20 !== null) {
+          if (volumeSpike && confirmedClosedClose > ema20) momentum = 'Volume Breakout';
+          else if (rsi !== null && rsi > 70) momentum = 'Overbought Expansion';
+          else if (rsi !== null && rsi < 30) momentum = 'Oversold Dip';
+          else if (confirmedClosedClose > ema20) momentum = 'EMA 20 Support Bounce';
+          else momentum = 'EMA 20 Resistance Pressure';
+        } else {
+          if (rsi !== null && rsi > 70) momentum = 'Overbought Expansion';
+          else if (rsi !== null && rsi < 30) momentum = 'Oversold Dip';
+        }
 
         mtfData[tf] = {
           currentClose,
+          closedClose: confirmedClosedClose,
           ema20,
           rsi,
           atr,
-          adx: adxInfo.adx,
-          plusDi: adxInfo.plusDi,
-          minusDi: adxInfo.minusDi,
+          adx: adxInfo ? adxInfo.adx : null,
+          plusDi: adxInfo ? adxInfo.plusDi : null,
+          minusDi: adxInfo ? adxInfo.minusDi : null,
           volumeSpike,
           trend,
           momentum
@@ -714,9 +950,9 @@ app.post('/api/evaluate', async (req, res) => {
     
     const currentPrice = marketData?.price || 64500;
     const currentAtr = marketData?.atr || (currentPrice * 0.015);
-    const currentAdx = marketData?.adx ?? 26.5;
-    const currentPlusDi = marketData?.plusDi ?? 27.2;
-    const currentMinusDi = marketData?.minusDi ?? 16.8;
+    const currentAdx = typeof marketData?.adx === 'number' ? marketData.adx : null;
+    const currentPlusDi = typeof marketData?.plusDi === 'number' ? marketData.plusDi : null;
+    const currentMinusDi = typeof marketData?.minusDi === 'number' ? marketData.minusDi : null;
 
     // Construct rich state representation with ADX, +DI, -DI
     const state = {
@@ -728,7 +964,7 @@ app.post('/api/evaluate', async (req, res) => {
       adx_14: currentAdx,
       plus_di: currentPlusDi,
       minus_di: currentMinusDi,
-      trend_strength: currentAdx < 20 ? 'CHOPPY_NO_TREND' : (currentAdx < 25 ? 'DEVELOPING_TREND' : (currentAdx < 40 ? 'STRONG_TREND' : 'VERY_STRONG_TREND')),
+      trend_strength: currentAdx === null ? 'INSUFFICIENT_DATA' : (currentAdx < 20 ? 'CHOPPY_NO_TREND' : (currentAdx < 25 ? 'DEVELOPING_TREND' : (currentAdx < 40 ? 'STRONG_TREND' : 'VERY_STRONG_TREND'))),
       timeframe_signals: mtfSignals || {
         '5m': 'Bullish Momentum',
         '15m': 'EMA 20 Bounce & Volume Spike',
@@ -818,9 +1054,12 @@ app.post('/api/evaluate', async (req, res) => {
     const dynamicConfidenceThreshold = Number(Math.min(0.94, Math.max(0.78, 0.80 + (volatilityRatio * 0.055))).toFixed(3));
     
     // ADX Chop Filter Gate:
-    // ADX >= 20 required for trend presence, and +DI > -DI required for Spot Buy trend alignment
-    const chopFilterPass = currentAdx >= 20.0 && currentPlusDi >= currentMinusDi;
-    const chopFilterStatus = currentAdx < 20.0 ? 'BLOCKED_CHOP_MARKET' : (currentPlusDi < currentMinusDi ? 'BLOCKED_BEARISH_DI' : 'PASSED_TRENDING');
+    // ADX >= 20 required for trend presence, and +DI >= -DI required for Spot Buy trend alignment
+    const isAdxValid = currentAdx !== null && currentPlusDi !== null && currentMinusDi !== null;
+    const chopFilterPass = isAdxValid && currentAdx >= 20.0 && currentPlusDi >= currentMinusDi;
+    const chopFilterStatus = !isAdxValid
+      ? 'BLOCKED_INSUFFICIENT_ADX'
+      : (currentAdx < 20.0 ? 'BLOCKED_CHOP_MARKET' : (currentPlusDi < currentMinusDi ? 'BLOCKED_BEARISH_DI' : 'PASSED_TRENDING'));
 
     const actionConfidence = answers.action?.confidence || 0.94;
     const convictionScore = Math.round(answers.conviction?.score ?? 2);
@@ -847,9 +1086,9 @@ app.post('/api/evaluate', async (req, res) => {
       circuitBreakerClear: true,
       meetsDynamicThreshold: actionConfidence >= dynamicConfidenceThreshold,
       // ADX Quantitative Edge & Chop Filter
-      adx: Number(currentAdx.toFixed(1)),
-      plusDi: Number(currentPlusDi.toFixed(1)),
-      minusDi: Number(currentMinusDi.toFixed(1)),
+      adx: currentAdx !== null ? Number(currentAdx.toFixed(1)) : null,
+      plusDi: currentPlusDi !== null ? Number(currentPlusDi.toFixed(1)) : null,
+      minusDi: currentMinusDi !== null ? Number(currentMinusDi.toFixed(1)) : null,
       chopFilterPass,
       chopFilterStatus,
       latencyMs,
@@ -943,6 +1182,36 @@ app.get('/api/paper-equity', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// API: Get standalone Python script code
+app.get('/api/python-code', async (req, res) => {
+  try {
+    const pyPath = path.resolve(__dirname, 'standalone_backtester.py');
+    if (!fs.existsSync(pyPath)) {
+      return res.status(404).json({ error: 'standalone_backtester.py not found' });
+    }
+    const code = fs.readFileSync(pyPath, 'utf8');
+    res.json({ code });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// API: Save standalone Python script code
+app.post('/api/python-code', async (req, res) => {
+  try {
+    const { code } = req.body;
+    if (typeof code !== 'string') {
+      return res.status(400).json({ error: 'Invalid code payload' });
+    }
+    const pyPath = path.resolve(__dirname, 'standalone_backtester.py');
+    fs.writeFileSync(pyPath, code, 'utf8');
+    res.json({ success: true, message: 'تم حفظ كود بايتون بنجاح في الخادم وتحديث السكربت!' });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 
 // Vite Middleware Integration for Development
 async function startServer() {
