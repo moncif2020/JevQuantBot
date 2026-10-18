@@ -170,6 +170,9 @@ interface JevEvaluation {
   dynamicConfidenceThreshold: number;
   volatilityRatio: number;
   dynamicPositionSize: number;
+  theoreticalPositionSize?: number;
+  finalConstrainedSize?: number;
+  availableCash?: number;
   meetsDynamicThreshold: boolean;
   convictionLevel: number; // 0, 1, 2, 3
   riskPercent: number;
@@ -517,7 +520,10 @@ export default function App() {
           actionConfidence: actionConf,
           dynamicConfidenceThreshold: dynamicThreshold,
           volatilityRatio: Number(volRatio.toFixed(2)),
-          dynamicPositionSize: data.dynamicPositionSize ?? 500,
+          dynamicPositionSize: data.dynamicPositionSize ?? 100,
+          theoreticalPositionSize: data.theoreticalPositionSize ?? 1500,
+          finalConstrainedSize: data.finalConstrainedSize ?? 100,
+          availableCash: data.availableCash ?? 500,
           meetsDynamicThreshold: meetsThreshold,
           convictionLevel: data.convictionLevel,
           adx: data.adx ?? 28.4,
@@ -2705,10 +2711,10 @@ export default function App() {
                     </div>
                     <div className="text-right">
                       <span className="text-xs font-bold text-amber-400 bg-amber-500/10 px-2.5 py-1 rounded-lg border border-amber-500/30">
-                        المستوى {jevDecision.convictionLevel}/3 ({jevDecision.riskPercent}% Risk)
+                        المستوى {jevDecision.convictionLevel}/3 ({jevDecision.convictionLevel === 3 ? '1.5x Multiplier' : jevDecision.convictionLevel === 2 ? '1.0x Multiplier' : '0.6x Multiplier'})
                       </span>
                       <div className="text-[11px] text-slate-400 font-mono mt-1">
-                        الحجم المتكيف: ${jevDecision.dynamicPositionSize} USDT
+                        الحجم النظري: ${jevDecision.theoreticalPositionSize ?? 1000} | المقيد نهائياً (حد 20%): <strong className="text-emerald-400">${jevDecision.dynamicPositionSize} USDT</strong>
                       </div>
                     </div>
                   </div>
@@ -2762,7 +2768,11 @@ export default function App() {
                         ADX: {jevDecision.adx} (+DI: {jevDecision.plusDi} / -DI: {jevDecision.minusDi})
                       </span>
                       <div className="text-[11px] text-slate-400 font-mono mt-1">
-                        {jevDecision.chopFilterPass ? '✓ اتجاه قوي ومؤهل للتنفيذ' : '🛡️ محجوب - سوق متذبذب عديم الاتجاه'}
+                        {jevDecision.chopFilterPass
+                          ? '✓ اتجاه قوي ومؤهل للتنفيذ'
+                          : (jevDecision.chopFilterStatus === 'BLOCKED_BEARISH_DI'
+                              ? '🛡️ محجوب - هيمنة الاتجاه الهبوطي (-DI > +DI)'
+                              : '🛡️ محجوب - سوق متذبذب عديم الاتجاه (ADX < 20)')}
                       </div>
                     </div>
                   </div>

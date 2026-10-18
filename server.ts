@@ -1065,8 +1065,11 @@ app.post('/api/evaluate', async (req, res) => {
     const convictionScore = Math.round(answers.conviction?.score ?? 2);
     const convictionMult = convictionScore === 3 ? 1.5 : (convictionScore === 2 ? 1.0 : (convictionScore === 1 ? 0.6 : 0.0));
     const confidenceMult = Math.min(1.3, Math.max(0.7, actionConfidence / dynamicConfidenceThreshold));
-    const baseAllocation = 100; // Base USDT allocation reference
-    const dynamicPositionSize = Number((baseAllocation * convictionMult * confidenceMult).toFixed(2));
+    const baseAllocation = 1000; // Base USDT allocation reference per canonical spec
+    const theoreticalPositionSize = Number((baseAllocation * convictionMult * confidenceMult).toFixed(2));
+    const availableCash = 500.0; // Standard reference equity
+    const maxByCapital = availableCash * 0.20; // 20% capital cap = 100 USDT
+    const finalConstrainedSize = Number(Math.min(theoreticalPositionSize, 2000.0, maxByCapital).toFixed(2));
 
     const evaluation = {
       model: data.model || 'jev-1.13.0',
@@ -1080,7 +1083,10 @@ app.post('/api/evaluate', async (req, res) => {
       actionConfidence,
       dynamicConfidenceThreshold,
       volatilityRatio: Number(volatilityRatio.toFixed(2)),
-      dynamicPositionSize,
+      dynamicPositionSize: finalConstrainedSize,
+      theoreticalPositionSize,
+      finalConstrainedSize,
+      availableCash,
       convictionLevel: convictionScore,
       riskPercent: answers.conviction?.score ? Number((answers.conviction.score * 0.65).toFixed(1)) : 1.5,
       circuitBreakerClear: true,
